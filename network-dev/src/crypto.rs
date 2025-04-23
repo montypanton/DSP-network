@@ -11,6 +11,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::message::{DeviceInfo, SessionKeys};
 
+// The kyber768 ciphertext size (from the spec: it's 1088 bytes)
+const KYBER_CIPHERTEXT_SIZE: usize = 1088;
+
 // The crypto context for a device
 pub struct CryptoContext {
     pub device_id: String,
@@ -78,7 +81,7 @@ impl CryptoContext {
         let nonce = Nonce::from_slice(&nonce_bytes);
         
         // Encrypt the message
-        let ciphertext_bytes = cipher.encrypt(nonce, message)
+        let encrypted_data = cipher.encrypt(nonce, message)
             .map_err(|e| format!("Encryption failed: {}", e))?;
             
         Ok((ciphertext.as_bytes().to_vec(), nonce_bytes.to_vec()))
@@ -86,6 +89,16 @@ impl CryptoContext {
     
     // Decrypt a message using Kyber and ChaCha20-Poly1305
     pub fn decrypt_message(&self, ciphertext: &[u8], nonce: &[u8], encrypted_data: &[u8]) -> Result<Vec<u8>, String> {
+        // Validate input sizes
+        if ciphertext.len() != KYBER_CIPHERTEXT_SIZE {
+            return Err(format!("Invalid ciphertext size: {} bytes, expected {}", 
+                            ciphertext.len(), KYBER_CIPHERTEXT_SIZE));
+        }
+        
+        if nonce.len() != 12 {
+            return Err(format!("Invalid nonce size: {} bytes, expected 12", nonce.len()));
+        }
+        
         // Convert the ciphertext bytes to a Kyber ciphertext
         let kyber_ciphertext = match kyber768::Ciphertext::from_bytes(ciphertext) {
             Ok(ct) => ct,
@@ -107,6 +120,11 @@ impl CryptoContext {
     
     // For forward secrecy: Create a new session key using X25519
     pub fn create_forward_secrecy_session(&self, recipient_id: &str, recipient_ephemeral_key: &[u8]) -> Result<X25519Public, String> {
+        // Validate input size
+        if recipient_ephemeral_key.len() != 32 {
+            return Err(format!("Invalid ephemeral key size: {} bytes, expected 32", recipient_ephemeral_key.len()));
+        }
+        
         // Generate a new ephemeral keypair
         let (ephemeral_secret, ephemeral_public) = self.generate_ephemeral_keypair();
         
@@ -193,7 +211,7 @@ impl CryptoContext {
     // Decrypt a message using the forward secrecy session
     pub fn decrypt_with_session(&self, sender_id: &str, encrypted_package: &[u8]) -> Result<Vec<u8>, String> {
         if encrypted_package.len() < 12 {
-            return Err("Invalid encrypted package".to_string());
+            return Err(format!("Invalid encrypted package: {} bytes, expected at least 12", encrypted_package.len()));
         }
         
         // Split into nonce and ciphertext

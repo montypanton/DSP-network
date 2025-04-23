@@ -18,6 +18,8 @@ pub struct EncryptedMessage {
     pub timestamp: u64,
     // For forward secrecy
     pub ephemeral_public: Option<String>, // New X25519 ephemeral public key
+    #[serde(default)] // This ensures backward compatibility with older messages
+    pub is_initial_kyber: bool, // Flag to indicate if this is an initial message using Kyber
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

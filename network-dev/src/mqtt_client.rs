@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde_json;
 use chrono::Utc;
-use pqcrypto_traits::kem::{PublicKey as PQPublicKey, SharedSecret as _, Ciphertext as _};
+use pqcrypto_traits::kem::PublicKey as PQPublicKey;
 
 #[derive(Clone)]
 pub struct MqttMessenger {
@@ -141,12 +141,30 @@ impl MqttMessenger {
                             }
                         }
                         
+                        // Updated decryption logic
                         let decryption_result = if let Some(_) = &enc_message.recipient_id {
-                            // Personal message - decrypt with session key
-                            crypto.decrypt_with_session(&enc_message.sender_id, &ct_bytes)
+                            // Check if this is an initial Kyber message before a session is established
+                            if enc_message.is_initial_kyber && ct_bytes.len() >= 1088 {
+                                crypto.decrypt_message(&ct_bytes[..1088], &nonce, &ct_bytes[1088..])
+                            } else {
+                                // Try session-based decryption first
+                                match crypto.decrypt_with_session(&enc_message.sender_id, &ct_bytes) {
+                                    Ok(plaintext) => Ok(plaintext),
+                                    Err(_) if ct_bytes.len() >= 1088 => {
+                                        // If session decryption fails and the ciphertext is large enough,
+                                        // try Kyber decryption as a fallback
+                                        crypto.decrypt_message(&ct_bytes[..1088], &nonce, &ct_bytes[1088..])
+                                    },
+                                    Err(e) => Err(e)
+                                }
+                            }
                         } else {
                             // Broadcast message - decrypt with Kyber
-                            crypto.decrypt_message(&ct_bytes[..1088], &nonce, &ct_bytes[1088..])
+                            if ct_bytes.len() >= 1088 {
+                                crypto.decrypt_message(&ct_bytes[..1088], &nonce, &ct_bytes[1088..])
+                            } else {
+                                Err(format!("Broadcast ciphertext too small: {} bytes", ct_bytes.len()))
+                            }
                         };
                         
                         if let Ok(decrypted) = decryption_result {
@@ -212,6 +230,7 @@ impl MqttMessenger {
             message_type: MessageType::DeviceAnnounce,
             timestamp: Utc::now().timestamp() as u64,
             ephemeral_public: None,
+            is_initial_kyber: false,
         };
         
         let message_json = serde_json::to_string(&message).map_err(|e| format!("JSON error: {}", e))?;
@@ -247,6 +266,7 @@ impl MqttMessenger {
             message_type: MessageType::KeyExchange,
             timestamp: Utc::now().timestamp() as u64,
             ephemeral_public: Some(BASE64.encode(public.as_bytes())),
+            is_initial_kyber: false,
         };
         
         let message_json = serde_json::to_string(&message).map_err(|e| format!("JSON error: {}", e))?;
@@ -275,7 +295,7 @@ impl MqttMessenger {
         
         let text_msg_json = serde_json::to_string(&text_msg).map_err(|e| format!("JSON error: {}", e))?;
         
-        let (encrypted_data, nonce, ephemeral_public, topic) = if let Some(recipient) = &recipient_id {
+        let (encrypted_data, nonce, ephemeral_public, topic, is_initial_kyber) = if let Some(recipient) = &recipient_id {
             // Personal message - use forward secrecy if available
             let recipient_info = {
                 let devices = self.known_devices.lock().unwrap();
@@ -292,7 +312,7 @@ impl MqttMessenger {
                     self.initialize_session(recipient)?;
                     
                     // Fall back to Kyber encryption for this message
-                    let (ciphertext, _nonce) = self.crypto.encrypt_message(&recipient_info.public_key, text_msg_json.as_bytes())?;
+                    let (ciphertext, nonce_bytes) = self.crypto.encrypt_message(&recipient_info.public_key, text_msg_json.as_bytes())?;
                     
                     // Combine ciphertext and encrypted data
                     let mut combined = Vec::new();
@@ -314,15 +334,18 @@ impl MqttMessenger {
                 vec![0u8; 12] // Should never happen
             };
             
-            (BASE64.encode(&encrypted), BASE64.encode(&nonce_bytes), eph_key, format!("secure-msg/device/{}", recipient))
+            // Set the is_initial_kyber flag based on whether we used session keys
+            let is_initial = maybe_new_ephemeral.is_none();
+            
+            (BASE64.encode(&encrypted), BASE64.encode(&nonce_bytes), eph_key, format!("secure-msg/device/{}", recipient), is_initial)
         } else {
             // Broadcast message - use Kyber for each known device (simplified to just basic encryption here)
             // Use PQPublicKey trait to access as_bytes
             let kyber_pk_bytes = self.crypto.kyber_public_key.as_bytes();
-            let (ciphertext, nonce) = self.crypto.encrypt_message(&BASE64.encode(kyber_pk_bytes), text_msg_json.as_bytes())?;
+            let (ciphertext, nonce_bytes) = self.crypto.encrypt_message(&BASE64.encode(kyber_pk_bytes), text_msg_json.as_bytes())?;
             
             // In reality, you'd encrypt differently for each recipient in a broadcast
-            (BASE64.encode(&ciphertext), BASE64.encode(&nonce), None, "secure-msg/broadcast".to_string())
+            (BASE64.encode(&ciphertext), BASE64.encode(&nonce_bytes), None, "secure-msg/broadcast".to_string(), false)
         };
         
         // Create the encrypted message envelope
@@ -334,6 +357,7 @@ impl MqttMessenger {
             message_type: MessageType::TextMessage,
             timestamp: Utc::now().timestamp() as u64,
             ephemeral_public,
+            is_initial_kyber,
         };
         
         let message_json = serde_json::to_string(&message).map_err(|e| format!("JSON error: {}", e))?;
