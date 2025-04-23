@@ -145,7 +145,7 @@ impl CryptoContext {
     
     // Encrypt a message using the forward secrecy session
     pub fn encrypt_with_session(&self, recipient_id: &str, message: &[u8]) -> Result<(Vec<u8>, Option<X25519Public>), String> {
-        let mut should_refresh = false;
+        let should_refresh = false;
         let shared_secret;
         
         // Get the current session key
@@ -155,7 +155,7 @@ impl CryptoContext {
                 shared_secret = session.shared_secret.clone();
                 // Decide if we should refresh the key (e.g., every 10 messages)
                 // This is a simplified approach - in a real system, you'd use a more sophisticated key rotation policy
-                should_refresh = rand::random::<u8>() < 20; // ~8% chance of refreshing
+                // should_refresh = rand::random::<u8>() < 20; // ~8% chance of refreshing
             } else {
                 return Err(format!("No session established with {}", recipient_id));
             }
@@ -201,7 +201,7 @@ impl CryptoContext {
         let ciphertext = &encrypted_package[12..];
         
         // Try to decrypt with current and previous session keys
-        let mut sessions = self.session_keys.lock().unwrap();
+        let sessions = self.session_keys.lock().unwrap();
         
         if let Some(session) = sessions.get(sender_id) {
             // Try the current key first

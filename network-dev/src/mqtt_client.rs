@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde_json;
 use chrono::Utc;
-use pqcrypto_traits::kem::PublicKey as PQPublicKey;
+use pqcrypto_traits::kem::{PublicKey as PQPublicKey, SharedSecret as _, Ciphertext as _};
 
 #[derive(Clone)]
 pub struct MqttMessenger {
@@ -64,7 +64,7 @@ impl MqttMessenger {
             loop {
                 match connection.recv() {
                     Ok(notification) => {
-                        if let Event::Incoming(Packet::Publish(publish)) = notification {
+                        if let Ok(Event::Incoming(Packet::Publish(publish))) = notification {
                             // Process received message
                             if let Ok(enc_message) = serde_json::from_slice::<EncryptedMessage>(&publish.payload) {
                                 Self::process_message(
@@ -277,10 +277,13 @@ impl MqttMessenger {
         
         let (encrypted_data, nonce, ephemeral_public, topic) = if let Some(recipient) = &recipient_id {
             // Personal message - use forward secrecy if available
-            let devices = self.known_devices.lock().unwrap();
-            let recipient_info = devices.iter().find(|d| d.device_id == *recipient)
-                .ok_or_else(|| format!("Device {} not found", recipient))?;
-                
+            let recipient_info = {
+                let devices = self.known_devices.lock().unwrap();
+                devices.iter().find(|d| d.device_id == *recipient)
+                    .ok_or_else(|| format!("Device {} not found", recipient))?
+                    .clone()
+            };
+            
             // Try to use session keys
             let (encrypted, maybe_new_ephemeral) = match self.crypto.encrypt_with_session(recipient, text_msg_json.as_bytes()) {
                 Ok((enc, eph)) => (enc, eph),
@@ -289,7 +292,7 @@ impl MqttMessenger {
                     self.initialize_session(recipient)?;
                     
                     // Fall back to Kyber encryption for this message
-                    let (ciphertext, nonce) = self.crypto.encrypt_message(&recipient_info.public_key, text_msg_json.as_bytes())?;
+                    let (ciphertext, _nonce) = self.crypto.encrypt_message(&recipient_info.public_key, text_msg_json.as_bytes())?;
                     
                     // Combine ciphertext and encrypted data
                     let mut combined = Vec::new();
