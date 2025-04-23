@@ -39,11 +39,14 @@ impl CryptoContext {
     
     // Create a device info object for sharing
     pub fn get_device_info(&self, display_name: &str) -> DeviceInfo {
+        // Generate an ephemeral key for this device to enable session establishment
+        let (_, ephemeral_public) = self.generate_ephemeral_keypair();
+        
         DeviceInfo {
             device_id: self.device_id.clone(),
             public_key: BASE64.encode(self.kyber_public_key.as_bytes()),
             display_name: display_name.to_string(),
-            ephemeral_key: None,
+            ephemeral_key: Some(BASE64.encode(ephemeral_public.as_bytes())),
         }
     }
     
@@ -114,7 +117,7 @@ impl CryptoContext {
         let shared_secret = kyber768::decapsulate(&kyber_ciphertext, &self.kyber_secret_key);
         
         // Create the ChaCha20-Poly1305 cipher
-        let aead_key = Key::from_slice(shared_secret.as_bytes());
+        let aead_key = Key::from_slice(&shared_secret.as_bytes()[0..32]);
         let cipher = ChaCha20Poly1305::new(aead_key);
         
         // Decrypt the message
@@ -134,9 +137,12 @@ impl CryptoContext {
         let (ephemeral_secret, ephemeral_public) = self.generate_ephemeral_keypair();
         
         // Convert the recipient's ephemeral key to an X25519 public key
-        let recipient_pubkey = match X25519Public::from(<[u8; 32]>::try_from(recipient_ephemeral_key).unwrap()) {
-            pub_key => pub_key,
+        let recipient_pubkey_bytes: [u8; 32] = match recipient_ephemeral_key.try_into() {
+            Ok(array) => array,
+            Err(_) => return Err("Failed to convert ephemeral key bytes to array".to_string()),
         };
+        
+        let recipient_pubkey = X25519Public::from(recipient_pubkey_bytes);
         
         // Compute the shared secret
         let shared_secret = ephemeral_secret.diffie_hellman(&recipient_pubkey);
@@ -154,6 +160,7 @@ impl CryptoContext {
             
             // Update with new secret
             session.shared_secret = shared_secret.as_bytes().to_vec();
+            println!("Updated existing session with {}", recipient_id);
         } else {
             // Create new session
             sessions.insert(recipient_id.to_string(), SessionKeys {
@@ -161,6 +168,7 @@ impl CryptoContext {
                 shared_secret: shared_secret.as_bytes().to_vec(),
                 previous_secrets: Vec::new(),
             });
+            println!("Created new session with {}", recipient_id);
         }
         
         Ok(ephemeral_public)
@@ -227,20 +235,27 @@ impl CryptoContext {
         let sessions = self.session_keys.lock().unwrap();
         
         if let Some(session) = sessions.get(sender_id) {
+            println!("Found session for {}", sender_id);
+            
             // Try the current key first
             let aead_key = Key::from_slice(&session.shared_secret[0..32]);
             let cipher = ChaCha20Poly1305::new(aead_key);
             let nonce = Nonce::from_slice(nonce_bytes);
             
             match cipher.decrypt(nonce, ciphertext) {
-                Ok(plaintext) => return Ok(plaintext),
+                Ok(plaintext) => {
+                    println!("Decryption successful with current key");
+                    return Ok(plaintext);
+                },
                 Err(_) => {
+                    println!("Current key failed, trying previous keys");
                     // Try previous keys
-                    for prev_secret in &session.previous_secrets {
+                    for (idx, prev_secret) in session.previous_secrets.iter().enumerate() {
                         let prev_key = Key::from_slice(&prev_secret[0..32]);
                         let prev_cipher = ChaCha20Poly1305::new(prev_key);
                         
                         if let Ok(plaintext) = prev_cipher.decrypt(nonce, ciphertext) {
+                            println!("Decryption successful with previous key {}", idx);
                             return Ok(plaintext);
                         }
                     }

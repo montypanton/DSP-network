@@ -73,11 +73,14 @@ fn start_messenger(broker: &str, port: u16, display_name: &str) -> Result<(), Bo
     
     println!("Device announced on network");
     
+    // Wait a moment to allow discovery to complete
+    thread::sleep(Duration::from_secs(1));
+    
     // Start a background thread to periodically announce presence
     let messenger_clone = Arc::clone(&messenger_arc);
     thread::spawn(move || {
         loop {
-            thread::sleep(Duration::from_secs(60));
+            thread::sleep(Duration::from_secs(30));
             if let Ok(mut messenger) = messenger_clone.lock() {
                 if let Err(e) = messenger.announce_presence() {
                     eprintln!("Failed to announce presence: {}", e);
@@ -142,6 +145,16 @@ fn start_messenger(broker: &str, port: u16, display_name: &str) -> Result<(), Bo
                 let recipient_id = parts[1];
                 let message = parts[2];
                 
+                // First try to establish a secure session
+                {
+                    let mut messenger = messenger_arc.lock().unwrap();
+                    let _ = messenger.initialize_session(recipient_id);
+                }
+                
+                // Small delay to allow session setup
+                thread::sleep(Duration::from_millis(100));
+                
+                // Then send the message
                 let result = {
                     let mut messenger = messenger_arc.lock().unwrap();
                     messenger.send_text_message(Some(recipient_id.to_string()), message)
