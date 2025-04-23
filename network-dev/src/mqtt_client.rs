@@ -1,17 +1,18 @@
 use crate::crypto::CryptoContext;
 use crate::message::{DeviceInfo, EncryptedMessage, MessageType, TextMessage};
-use rumqttc::{Client, MqttOptions, QoS, Event, Packet, ConnectionError};
+use rumqttc::{Client, MqttOptions, QoS, Event, Packet};
 use std::time::Duration;
 use std::thread;
 use std::sync::{Arc, Mutex};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use x25519_dalek::PublicKey as X25519Public;
 use serde_json;
 use chrono::Utc;
+use pqcrypto_traits::kem::PublicKey as PQPublicKey;
 
+#[derive(Clone)]
 pub struct MqttMessenger {
     device_id: String,
-    client: Client,
+    client: Arc<Mutex<Client>>,
     crypto: Arc<CryptoContext>,
     display_name: String,
     known_devices: Arc<Mutex<Vec<DeviceInfo>>>,
@@ -36,6 +37,7 @@ impl MqttMessenger {
         mqttopts.set_keep_alive(Duration::from_secs(30));
         
         let (client, mut connection) = Client::new(mqttopts, 10);
+        let client = Arc::new(Mutex::new(client));
         
         // Clone what we need for the event loop thread
         let thread_crypto = Arc::clone(&crypto);
@@ -46,7 +48,7 @@ impl MqttMessenger {
         let thread_callback = Arc::clone(&message_callback);
         
         // Create the messenger instance
-        let messenger = Self {
+        let mut messenger = Self {
             device_id: device_id.clone(),
             client,
             crypto,
@@ -170,16 +172,18 @@ impl MqttMessenger {
     }
     
     // Subscribe to necessary topics
-    fn subscribe_to_topics(&self) -> Result<(), String> {
+    fn subscribe_to_topics(&mut self) -> Result<(), String> {
+        let mut client = self.client.lock().unwrap();
+        
         // Personal topic for direct messages
         let personal_topic = format!("secure-msg/device/{}", self.device_id);
-        self.client.subscribe(personal_topic, QoS::AtLeastOnce).map_err(|e| format!("Subscription error: {:?}", e))?;
+        client.subscribe(personal_topic, QoS::AtLeastOnce).map_err(|e| format!("Subscription error: {:?}", e))?;
         
         // Broadcast topic
-        self.client.subscribe("secure-msg/broadcast", QoS::AtLeastOnce).map_err(|e| format!("Subscription error: {:?}", e))?;
+        client.subscribe("secure-msg/broadcast", QoS::AtLeastOnce).map_err(|e| format!("Subscription error: {:?}", e))?;
         
         // Discovery topic
-        self.client.subscribe("secure-msg/discovery", QoS::AtLeastOnce).map_err(|e| format!("Subscription error: {:?}", e))?;
+        client.subscribe("secure-msg/discovery", QoS::AtLeastOnce).map_err(|e| format!("Subscription error: {:?}", e))?;
         
         Ok(())
     }
@@ -194,7 +198,7 @@ impl MqttMessenger {
     }
     
     // Announce this device to the network
-    pub fn announce_presence(&self) -> Result<(), String> {
+    pub fn announce_presence(&mut self) -> Result<(), String> {
         // Create device info message
         let device_info = self.crypto.get_device_info(&self.display_name);
         let device_info_json = serde_json::to_string(&device_info).map_err(|e| format!("JSON error: {}", e))?;
@@ -213,7 +217,8 @@ impl MqttMessenger {
         let message_json = serde_json::to_string(&message).map_err(|e| format!("JSON error: {}", e))?;
         
         // Publish to discovery topic
-        self.client.publish(
+        let mut client = self.client.lock().unwrap();
+        client.publish(
             "secure-msg/discovery",
             QoS::AtLeastOnce,
             false,
@@ -224,14 +229,14 @@ impl MqttMessenger {
     }
     
     // Initialize a forward secrecy session with another device
-    pub fn initialize_session(&self, recipient_id: &str) -> Result<(), String> {
+    pub fn initialize_session(&mut self, recipient_id: &str) -> Result<(), String> {
         // Find the recipient's device info
         let devices = self.known_devices.lock().unwrap();
-        let recipient = devices.iter().find(|d| d.device_id == recipient_id)
+        let _recipient = devices.iter().find(|d| d.device_id == recipient_id)
             .ok_or_else(|| format!("Device {} not found", recipient_id))?;
             
         // Generate an ephemeral keypair
-        let (secret, public) = self.crypto.generate_ephemeral_keypair();
+        let (_, public) = self.crypto.generate_ephemeral_keypair();
         
         // Create a key exchange message
         let message = EncryptedMessage {
@@ -248,7 +253,8 @@ impl MqttMessenger {
         
         // Send the key exchange message
         let recipient_topic = format!("secure-msg/device/{}", recipient_id);
-        self.client.publish(
+        let mut client = self.client.lock().unwrap();
+        client.publish(
             recipient_topic,
             QoS::AtLeastOnce,
             false,
@@ -259,7 +265,7 @@ impl MqttMessenger {
     }
     
     // Send a text message to another device
-    pub fn send_text_message(&self, recipient_id: Option<String>, content: &str) -> Result<(), String> {
+    pub fn send_text_message(&mut self, recipient_id: Option<String>, content: &str) -> Result<(), String> {
         // Create the text message
         let text_msg = TextMessage {
             content: content.to_string(),
@@ -308,7 +314,9 @@ impl MqttMessenger {
             (BASE64.encode(&encrypted), BASE64.encode(&nonce_bytes), eph_key, format!("secure-msg/device/{}", recipient))
         } else {
             // Broadcast message - use Kyber for each known device (simplified to just basic encryption here)
-            let (ciphertext, nonce) = self.crypto.encrypt_message(&BASE64.encode(&self.crypto.kyber_public_key.as_bytes()), text_msg_json.as_bytes())?;
+            // Use PQPublicKey trait to access as_bytes
+            let kyber_pk_bytes = self.crypto.kyber_public_key.as_bytes();
+            let (ciphertext, nonce) = self.crypto.encrypt_message(&BASE64.encode(kyber_pk_bytes), text_msg_json.as_bytes())?;
             
             // In reality, you'd encrypt differently for each recipient in a broadcast
             (BASE64.encode(&ciphertext), BASE64.encode(&nonce), None, "secure-msg/broadcast".to_string())
@@ -328,7 +336,8 @@ impl MqttMessenger {
         let message_json = serde_json::to_string(&message).map_err(|e| format!("JSON error: {}", e))?;
         
         // Send the message
-        self.client.publish(
+        let mut client = self.client.lock().unwrap();
+        client.publish(
             topic,
             QoS::AtLeastOnce,
             false,

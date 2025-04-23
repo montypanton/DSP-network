@@ -4,7 +4,7 @@ mod device;
 mod message;
 
 use structopt::StructOpt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::io::{self, BufRead, Write};
 use std::thread;
 use std::time::Duration;
@@ -55,24 +55,33 @@ fn start_messenger(broker: &str, port: u16, display_name: &str) -> Result<(), Bo
         Arc::clone(&crypto_context),
     )?;
     
-    // Set up message callback
-    messenger.set_message_callback(|sender, message| {
-        println!("\n{}: {}", sender.yellow(), message);
-        print!("{}", "> ".green());
-        io::stdout().flush().unwrap();
-    });
+    // Wrap messenger in Arc<Mutex<>> for thread-safe sharing
+    let messenger_arc = Arc::new(Mutex::new(messenger));
     
-    // Announce presence
-    messenger.announce_presence()?;
+    // Set up message callback
+    {
+        let mut messenger = messenger_arc.lock().unwrap();
+        messenger.set_message_callback(|sender, message| {
+            println!("\n{}: {}", sender.yellow(), message);
+            print!("{}", "> ".green());
+            io::stdout().flush().unwrap();
+        });
+        
+        // Announce presence
+        messenger.announce_presence()?;
+    }
+    
     println!("Device announced on network");
     
     // Start a background thread to periodically announce presence
-    let messenger_clone = messenger.clone();
+    let messenger_clone = Arc::clone(&messenger_arc);
     thread::spawn(move || {
         loop {
             thread::sleep(Duration::from_secs(60));
-            if let Err(e) = messenger_clone.announce_presence() {
-                eprintln!("Failed to announce presence: {}", e);
+            if let Ok(mut messenger) = messenger_clone.lock() {
+                if let Err(e) = messenger.announce_presence() {
+                    eprintln!("Failed to announce presence: {}", e);
+                }
             }
         }
     });
@@ -108,7 +117,11 @@ fn start_messenger(broker: &str, port: u16, display_name: &str) -> Result<(), Bo
                 break;
             },
             "devices" => {
-                let devices = messenger.get_known_devices();
+                let devices = {
+                    let messenger = messenger_arc.lock().unwrap();
+                    messenger.get_known_devices()
+                };
+                
                 println!("\n{} known devices:", devices.len());
                 for device in devices {
                     println!("  {} ({}): {}", 
@@ -128,7 +141,12 @@ fn start_messenger(broker: &str, port: u16, display_name: &str) -> Result<(), Bo
                 let recipient_id = parts[1];
                 let message = parts[2];
                 
-                match messenger.send_text_message(Some(recipient_id.to_string()), message) {
+                let result = {
+                    let mut messenger = messenger_arc.lock().unwrap();
+                    messenger.send_text_message(Some(recipient_id.to_string()), message)
+                };
+                
+                match result {
                     Ok(_) => println!("Message sent to {}", recipient_id.cyan()),
                     Err(e) => println!("Failed to send message: {}", e.red()),
                 }
@@ -141,7 +159,12 @@ fn start_messenger(broker: &str, port: u16, display_name: &str) -> Result<(), Bo
                 
                 let message = if parts.len() == 2 { parts[1] } else { &input[10..] };
                 
-                match messenger.send_text_message(None, message) {
+                let result = {
+                    let mut messenger = messenger_arc.lock().unwrap();
+                    messenger.send_text_message(None, message)
+                };
+                
+                match result {
                     Ok(_) => println!("Broadcast message sent"),
                     Err(e) => println!("Failed to broadcast message: {}", e.red()),
                 }
@@ -154,7 +177,12 @@ fn start_messenger(broker: &str, port: u16, display_name: &str) -> Result<(), Bo
                 
                 let recipient_id = parts[1];
                 
-                match messenger.initialize_session(recipient_id) {
+                let result = {
+                    let mut messenger = messenger_arc.lock().unwrap();
+                    messenger.initialize_session(recipient_id)
+                };
+                
+                match result {
                     Ok(_) => println!("Secure session established with {}", recipient_id.cyan()),
                     Err(e) => println!("Failed to establish session: {}", e.red()),
                 }

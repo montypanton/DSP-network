@@ -1,13 +1,15 @@
-use crate::message::{DeviceInfo, SessionKeys};
 use pqcrypto_kyber::kyber768::{self, PublicKey, SecretKey};
-use pqcrypto_traits::kem::{PublicKey as _, SecretKey as _, SharedSecret as _, Ciphertext as _};
+use pqcrypto_traits::kem::{PublicKey as PQPublicKey, SharedSecret as _, Ciphertext as _};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use chacha20poly1305::aead::{Aead, NewAead};
+use chacha20poly1305::aead::Aead;
+use chacha20poly1305::KeyInit;
 use rand::{rngs::OsRng, RngCore};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519Public};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+use crate::message::{DeviceInfo, SessionKeys};
 
 // The crypto context for a device
 pub struct CryptoContext {
@@ -47,7 +49,7 @@ impl CryptoContext {
     
     // Generate a new X25519 ephemeral keypair
     pub fn generate_ephemeral_keypair(&self) -> (EphemeralSecret, X25519Public) {
-        let secret = EphemeralSecret::new(OsRng);
+        let secret = EphemeralSecret::random_from_rng(OsRng);
         let public = X25519Public::from(&secret);
         (secret, public)
     }
@@ -174,7 +176,7 @@ impl CryptoContext {
         
         // If we should refresh, generate a new ephemeral key
         let new_ephemeral = if should_refresh {
-            let (secret, public) = self.generate_ephemeral_keypair();
+            let (_, public) = self.generate_ephemeral_keypair();
             Some(public)
         } else {
             None

@@ -1,7 +1,7 @@
 use crate::message::DeviceInfo;
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct DeviceManager {
     known_devices: Arc<Mutex<HashMap<String, DeviceInfo>>>,
