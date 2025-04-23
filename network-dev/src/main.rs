@@ -119,7 +119,8 @@ fn start_messenger(broker: &str, port: u16, display_name: &str) -> Result<(), Bo
             "devices" => {
                 let devices = {
                     let messenger = messenger_arc.lock().unwrap();
-                    messenger.get_known_devices()
+                    let devices = messenger.get_known_devices();
+                    devices
                 };
                 
                 println!("\n{} known devices:", devices.len());

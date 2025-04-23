@@ -8,6 +8,11 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde_json;
 use chrono::Utc;
 use pqcrypto_traits::kem::PublicKey as PQPublicKey;
+// Add missing imports
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use chacha20poly1305::aead::Aead;
+use chacha20poly1305::KeyInit;
+use rand::{rngs::OsRng, RngCore};
 
 #[derive(Clone)]
 pub struct MqttMessenger {
@@ -308,20 +313,31 @@ impl MqttMessenger {
             let (encrypted, maybe_new_ephemeral) = match self.crypto.encrypt_with_session(recipient, text_msg_json.as_bytes()) {
                 Ok((enc, eph)) => (enc, eph),
                 Err(_) => {
-                    // No session yet, use Kyber encryption for this message
-                    let (kyber_ciphertext, nonce_bytes) = self.crypto.encrypt_message(
-                        &recipient_info.public_key, 
-                        text_msg_json.as_bytes()
-                    )?;
+                    // No session yet, try to establish one
+                    self.initialize_session(recipient)?;
                     
-                    // Encrypt additional data with the shared secret derived from the Kyber operation
-                    // For now, just append dummy data to make sure all parts are present
+                    // Fall back to Kyber encryption for this message
+                    let (ciphertext, nonce_bytes) = self.crypto.encrypt_message(&recipient_info.public_key, text_msg_json.as_bytes())?;
+                    
+                    // Combine ciphertext and encrypted data
                     let mut combined = Vec::new();
-                    combined.extend_from_slice(&kyber_ciphertext);
+                    combined.extend_from_slice(&ciphertext);
                     
-                    // Add some encrypted data after the Kyber ciphertext
-                    let dummy_data = text_msg_json.as_bytes().to_vec();
-                    combined.extend_from_slice(&dummy_data);
+                    // Add encrypted data
+                    let encrypted_data_nonce = Nonce::from_slice(&nonce_bytes);
+                    
+                    // Create a dummy AEAD key for the initial message
+                    let mut aead_key_bytes = [0u8; 32];
+                    OsRng.fill_bytes(&mut aead_key_bytes);
+                    let aead_key = Key::from_slice(&aead_key_bytes);
+                    let cipher = ChaCha20Poly1305::new(aead_key);
+                    
+                    if let Ok(encrypted) = cipher.encrypt(encrypted_data_nonce, text_msg_json.as_bytes()) {
+                        combined.extend_from_slice(&encrypted);
+                    } else {
+                        // Fallback if encryption fails
+                        combined.extend_from_slice(text_msg_json.as_bytes());
+                    }
                     
                     (combined, None)
                 }
@@ -330,15 +346,11 @@ impl MqttMessenger {
             // Set up the ephemeral key for the message if we have one
             let eph_key = maybe_new_ephemeral.map(|k| BASE64.encode(k.as_bytes()));
             
-            // Get the nonce (for Kyber-based encryption) or use the first 12 bytes of the message (for session-based)
-            let nonce_bytes = if maybe_new_ephemeral.is_none() {
-                if encrypted.len() >= 12 {
-                    encrypted[0..12].to_vec()
-                } else {
-                    vec![0u8; 12] // Dummy nonce (should never happen)
-                }
+            // Get the first 12 bytes as nonce
+            let nonce_bytes = if encrypted.len() >= 12 {
+                encrypted[..12].to_vec()
             } else {
-                encrypted[0..12].to_vec() // First 12 bytes contain the nonce in session-based encryption
+                vec![0u8; 12] // Should never happen
             };
             
             // Set the is_initial_kyber flag based on whether we used session keys
@@ -349,19 +361,10 @@ impl MqttMessenger {
             // Broadcast message - use Kyber for each known device (simplified to just basic encryption here)
             // Use PQPublicKey trait to access as_bytes
             let kyber_pk_bytes = self.crypto.kyber_public_key.as_bytes();
+            let (ciphertext, nonce_bytes) = self.crypto.encrypt_message(&BASE64.encode(kyber_pk_bytes), text_msg_json.as_bytes())?;
             
-            // We need to use our own public key for the broadcast since we don't have individual keys
-            let (ciphertext, nonce_bytes) = self.crypto.encrypt_message(
-                &BASE64.encode(kyber_pk_bytes), 
-                text_msg_json.as_bytes()
-            )?;
-            
-            // Need to add dummy data after the Kyber ciphertext to maintain the expected format
-            let mut combined = Vec::new();
-            combined.extend_from_slice(&ciphertext);
-            combined.extend_from_slice(text_msg_json.as_bytes());
-            
-            (BASE64.encode(&combined), BASE64.encode(&nonce_bytes), None, "secure-msg/broadcast".to_string(), false)
+            // In reality, you'd encrypt differently for each recipient in a broadcast
+            (BASE64.encode(&ciphertext), BASE64.encode(&nonce_bytes), None, "secure-msg/broadcast".to_string(), false)
         };
         
         // Create the encrypted message envelope

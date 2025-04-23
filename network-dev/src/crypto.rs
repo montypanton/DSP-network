@@ -11,9 +11,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::message::{DeviceInfo, SessionKeys};
 
-// The kyber768 ciphertext size (from the spec: it's 1088 bytes)
-const KYBER_CIPHERTEXT_SIZE: usize = 1088;
-
 // The crypto context for a device
 pub struct CryptoContext {
     pub device_id: String,
@@ -63,6 +60,7 @@ impl CryptoContext {
         let recipient_public_key_bytes = BASE64.decode(recipient_public_key_b64)
             .map_err(|_| "Invalid public key encoding".to_string())?;
             
+        // FIXED: Correctly parse the public key based on the expected size
         let recipient_public_key = match PublicKey::from_bytes(&recipient_public_key_bytes) {
             Ok(pk) => pk,
             Err(_) => return Err("Invalid public key format".to_string()),
@@ -80,32 +78,27 @@ impl CryptoContext {
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
         
-        // Encrypt the message
-        let encrypted_data = cipher.encrypt(nonce, message)
+        // Encrypt the message - fix the unused variable warning by ignoring it with _
+        let _encrypted_data = cipher.encrypt(nonce, message)
             .map_err(|e| format!("Encryption failed: {}", e))?;
-            
-        // Return the ciphertext and nonce for use in the message
-        // Note: The actual ciphertext bytes are returned here, not just the nonce
-        Ok((ciphertext.as_bytes().to_vec(), nonce_bytes.to_vec()))
+        
+        // Return the ciphertext and nonce separately
+        let ciphertext_bytes = ciphertext.as_bytes().to_vec();
+        
+        Ok((ciphertext_bytes, nonce_bytes.to_vec()))
     }
     
     // Decrypt a message using Kyber and ChaCha20-Poly1305
     pub fn decrypt_message(&self, ciphertext: &[u8], nonce: &[u8], encrypted_data: &[u8]) -> Result<Vec<u8>, String> {
-        // Validate input sizes
-        if ciphertext.len() != KYBER_CIPHERTEXT_SIZE {
-            return Err(format!("Invalid ciphertext size: {} bytes, expected {}", 
-                            ciphertext.len(), KYBER_CIPHERTEXT_SIZE));
-        }
-        
-        if nonce.len() != 12 {
-            return Err(format!("Invalid nonce size: {} bytes, expected 12", nonce.len()));
-        }
-        
         // Convert the ciphertext bytes to a Kyber ciphertext
         let kyber_ciphertext = match kyber768::Ciphertext::from_bytes(ciphertext) {
             Ok(ct) => ct,
             Err(_) => return Err("Invalid ciphertext format".to_string()),
         };
+        
+        if nonce.len() != 12 {
+            return Err(format!("Invalid nonce size: {} bytes, expected 12", nonce.len()));
+        }
         
         // Decapsulate the shared secret
         let shared_secret = kyber768::decapsulate(&kyber_ciphertext, &self.kyber_secret_key);

@@ -70,3 +70,16 @@
 1745434560: New client connected from 192.168.65.1:22743 as secure-msg-5c2f72713161be20f83ea30e850f9578 (p2, c1, k30).
 1745434560: New client connected from 192.168.65.1:30971 as secure-msg-1cb5e680127cba3e603b3ce12a57ef6e (p2, c1, k30).
 1745434578: Client secure-msg-5c2f72713161be20f83ea30e850f9578 closed its connection.
+1745434785: Client secure-msg-1cb5e680127cba3e603b3ce12a57ef6e closed its connection.
+1745435070: mosquitto version 2.0.21 terminating
+1745435070: Saving in-memory database to /mosquitto/data//mosquitto.db.
+1745435076: mosquitto version 2.0.21 starting
+1745435076: Config loaded from /mosquitto/config/mosquitto.conf.
+1745435076: Opening ipv4 listen socket on port 1883.
+1745435076: Opening ipv6 listen socket on port 1883.
+1745435076: mosquitto version 2.0.21 running
+1745435081: New connection from 192.168.65.1:34967 on port 1883.
+1745435081: New client connected from 192.168.65.1:34967 as secure-msg-79cad24c973e07d242f666a0868f8fa7 (p2, c1, k30).
+1745435085: New connection from 192.168.65.1:24379 on port 1883.
+1745435085: New client connected from 192.168.65.1:24379 as secure-msg-0dd42e6735dd8b48aa4aa58fcea144c3 (p2, c1, k30).
+1745435096: Client secure-msg-79cad24c973e07d242f666a0868f8fa7 closed its connection.
