@@ -256,11 +256,16 @@ impl MqttMessenger {
     pub fn initialize_session(&mut self, recipient_id: &str) -> Result<(), String> {
         // Find the recipient's device info
         let devices = self.known_devices.lock().unwrap();
-        let _recipient = devices.iter().find(|d| d.device_id == recipient_id)
-            .ok_or_else(|| format!("Device {} not found", recipient_id))?;
+        let recipient = devices.iter().find(|d| d.device_id == recipient_id)
+            .ok_or_else(|| format!("Device {} not found", recipient_id))?
+            .clone();
+        
+        // Drop the lock before proceeding with potentially time-consuming operations
+        drop(devices);
             
         // Generate an ephemeral keypair
         let (_, public) = self.crypto.generate_ephemeral_keypair();
+        let ephemeral_key_b64 = BASE64.encode(public.as_bytes());
         
         // Create a key exchange message
         let message = EncryptedMessage {
@@ -270,7 +275,7 @@ impl MqttMessenger {
             nonce: "".to_string(),
             message_type: MessageType::KeyExchange,
             timestamp: Utc::now().timestamp() as u64,
-            ephemeral_public: Some(BASE64.encode(public.as_bytes())),
+            ephemeral_public: Some(ephemeral_key_b64),
             is_initial_kyber: false,
         };
         
@@ -285,6 +290,16 @@ impl MqttMessenger {
             false,
             message_json.as_bytes(),
         ).map_err(|e| format!("Publish error: {:?}", e))?;
+        
+        // Also create a client-side session
+        if let Some(ephemeral_key) = recipient.ephemeral_key {
+            // If the recipient has already shared their ephemeral key, use it
+            let ephemeral_bytes = BASE64.decode(&ephemeral_key)
+                .map_err(|_| "Invalid ephemeral key encoding".to_string())?;
+            
+            // Create a session on our side too
+            self.crypto.handle_ephemeral_key(recipient_id, &ephemeral_bytes)?;
+        }
         
         Ok(())
     }
@@ -309,47 +324,53 @@ impl MqttMessenger {
                     .clone()
             };
             
-            // Try to use session keys
-            let (encrypted, maybe_new_ephemeral) = match self.crypto.encrypt_with_session(recipient, text_msg_json.as_bytes()) {
-                Ok((enc, eph)) => (enc, eph),
+            // Try to use session keys first
+            let encryption_result = self.crypto.encrypt_with_session(recipient, text_msg_json.as_bytes());
+            
+            match encryption_result {
+                Ok((enc, eph)) => {
+                    // Successfully encrypted with session keys
+                    // Get the first 12 bytes as nonce (if available)
+                    let nonce_bytes = if enc.len() >= 12 {
+                        enc[..12].to_vec()
+                    } else {
+                        vec![0u8; 12]
+                    };
+                    
+                    // Set up the ephemeral key for the message if we have one
+                    let eph_key = eph.map(|k| BASE64.encode(k.as_bytes()));
+                    
+                    (BASE64.encode(&enc), BASE64.encode(&nonce_bytes), eph_key, 
+                     format!("secure-msg/device/{}", recipient), false)
+                },
                 Err(_) => {
                     // No session yet, try to establish one
-                    self.initialize_session(recipient)?;
+                    let _ = self.initialize_session(recipient);
                     
                     // Fall back to Kyber encryption for this message
                     let (ciphertext, nonce_bytes) = self.crypto.encrypt_message(&recipient_info.public_key, text_msg_json.as_bytes())?;
-                    (ciphertext, None)
+                    
+                    (BASE64.encode(&ciphertext), BASE64.encode(&nonce_bytes), None, 
+                     format!("secure-msg/device/{}", recipient), true)
                 }
-            };
-            
-            // Set up the ephemeral key for the message if we have one
-            let eph_key = maybe_new_ephemeral.map(|k| BASE64.encode(k.as_bytes()));
-            
-            // Get the first 12 bytes as nonce
-            let nonce_bytes = if encrypted.len() >= 12 {
-                encrypted[..12].to_vec()
-            } else {
-                vec![0u8; 12] // Should never happen
-            };
-            
-            // Set the is_initial_kyber flag based on whether we used session keys
-            let is_initial = maybe_new_ephemeral.is_none();
-            
-            (BASE64.encode(&encrypted), BASE64.encode(&nonce_bytes), eph_key, format!("secure-msg/device/{}", recipient), is_initial)
+            }
         } else {
             // Broadcast message - use Kyber for each known device (simplified to just basic encryption here)
-            // Use PQPublicKey trait to access as_bytes
+            // Get our own public key in Base64 format for encryption
             let kyber_pk_bytes = self.crypto.kyber_public_key.as_bytes();
-            let (ciphertext, nonce_bytes) = self.crypto.encrypt_message(&BASE64.encode(kyber_pk_bytes), text_msg_json.as_bytes())?;
+            let encoded_pk = BASE64.encode(kyber_pk_bytes);
             
-            // In reality, you'd encrypt differently for each recipient in a broadcast
-            (BASE64.encode(&ciphertext), BASE64.encode(&nonce_bytes), None, "secure-msg/broadcast".to_string(), false)
+            // Use our own public key just to create a valid encryption (this is a simplification)
+            let (ciphertext, nonce_bytes) = self.crypto.encrypt_message(&encoded_pk, text_msg_json.as_bytes())?;
+            
+            (BASE64.encode(&ciphertext), BASE64.encode(&nonce_bytes), None, 
+             "secure-msg/broadcast".to_string(), true)
         };
         
         // Create the encrypted message envelope
         let message = EncryptedMessage {
             sender_id: self.device_id.clone(),
-            recipient_id: recipient_id,
+            recipient_id,
             encrypted_data,
             nonce,
             message_type: MessageType::TextMessage,

@@ -61,13 +61,14 @@ impl CryptoContext {
             .map_err(|_| "Invalid public key encoding".to_string())?;
         
         // Make sure we have the correct key size for Kyber768
-        if recipient_public_key_bytes.len() != kyber768::public_key_bytes() {
-            return Err(format!("Invalid public key size: {} bytes, expected {}", 
+        let expected_size = kyber768::public_key_bytes();
+        if recipient_public_key_bytes.len() != expected_size {
+            return Err(format!("Invalid public key size: {} bytes, expected {} bytes for Kyber768", 
                              recipient_public_key_bytes.len(), 
-                             kyber768::public_key_bytes()));
+                             expected_size));
         }
         
-        // Create the PublicKey directly from bytes without trying to convert to GenericArray
+        // Create the PublicKey directly from bytes
         let recipient_public_key = match PublicKey::from_bytes(&recipient_public_key_bytes) {
             Ok(pk) => pk,
             Err(_) => return Err("Invalid public key format".to_string()),
@@ -77,7 +78,7 @@ impl CryptoContext {
         let (ciphertext, shared_secret) = kyber768::encapsulate(&recipient_public_key);
         
         // Use the shared secret to create a ChaCha20-Poly1305 key
-        let aead_key = Key::from_slice(&shared_secret.as_bytes());
+        let aead_key = Key::from_slice(&shared_secret.as_bytes()[0..32]); // Ensure we use the right key size
         let cipher = ChaCha20Poly1305::new(aead_key);
         
         // Generate a random nonce
