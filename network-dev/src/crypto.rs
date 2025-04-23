@@ -84,6 +84,8 @@ impl CryptoContext {
         let encrypted_data = cipher.encrypt(nonce, message)
             .map_err(|e| format!("Encryption failed: {}", e))?;
             
+        // Return the ciphertext and nonce for use in the message
+        // Note: The actual ciphertext bytes are returned here, not just the nonce
         Ok((ciphertext.as_bytes().to_vec(), nonce_bytes.to_vec()))
     }
     

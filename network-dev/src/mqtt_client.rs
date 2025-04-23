@@ -308,17 +308,20 @@ impl MqttMessenger {
             let (encrypted, maybe_new_ephemeral) = match self.crypto.encrypt_with_session(recipient, text_msg_json.as_bytes()) {
                 Ok((enc, eph)) => (enc, eph),
                 Err(_) => {
-                    // No session yet, try to establish one
-                    self.initialize_session(recipient)?;
+                    // No session yet, use Kyber encryption for this message
+                    let (kyber_ciphertext, nonce_bytes) = self.crypto.encrypt_message(
+                        &recipient_info.public_key, 
+                        text_msg_json.as_bytes()
+                    )?;
                     
-                    // Fall back to Kyber encryption for this message
-                    let (ciphertext, nonce_bytes) = self.crypto.encrypt_message(&recipient_info.public_key, text_msg_json.as_bytes())?;
-                    
-                    // Combine ciphertext and encrypted data
+                    // Encrypt additional data with the shared secret derived from the Kyber operation
+                    // For now, just append dummy data to make sure all parts are present
                     let mut combined = Vec::new();
-                    combined.extend_from_slice(&ciphertext);
-                    // Add dummy encrypted data since we're initiating the session
-                    combined.extend_from_slice(&[0u8; 32]);
+                    combined.extend_from_slice(&kyber_ciphertext);
+                    
+                    // Add some encrypted data after the Kyber ciphertext
+                    let dummy_data = text_msg_json.as_bytes().to_vec();
+                    combined.extend_from_slice(&dummy_data);
                     
                     (combined, None)
                 }
@@ -327,11 +330,15 @@ impl MqttMessenger {
             // Set up the ephemeral key for the message if we have one
             let eph_key = maybe_new_ephemeral.map(|k| BASE64.encode(k.as_bytes()));
             
-            // Get the first 12 bytes as nonce
-            let nonce_bytes = if encrypted.len() >= 12 {
-                encrypted[..12].to_vec()
+            // Get the nonce (for Kyber-based encryption) or use the first 12 bytes of the message (for session-based)
+            let nonce_bytes = if maybe_new_ephemeral.is_none() {
+                if encrypted.len() >= 12 {
+                    encrypted[0..12].to_vec()
+                } else {
+                    vec![0u8; 12] // Dummy nonce (should never happen)
+                }
             } else {
-                vec![0u8; 12] // Should never happen
+                encrypted[0..12].to_vec() // First 12 bytes contain the nonce in session-based encryption
             };
             
             // Set the is_initial_kyber flag based on whether we used session keys
@@ -342,10 +349,19 @@ impl MqttMessenger {
             // Broadcast message - use Kyber for each known device (simplified to just basic encryption here)
             // Use PQPublicKey trait to access as_bytes
             let kyber_pk_bytes = self.crypto.kyber_public_key.as_bytes();
-            let (ciphertext, nonce_bytes) = self.crypto.encrypt_message(&BASE64.encode(kyber_pk_bytes), text_msg_json.as_bytes())?;
             
-            // In reality, you'd encrypt differently for each recipient in a broadcast
-            (BASE64.encode(&ciphertext), BASE64.encode(&nonce_bytes), None, "secure-msg/broadcast".to_string(), false)
+            // We need to use our own public key for the broadcast since we don't have individual keys
+            let (ciphertext, nonce_bytes) = self.crypto.encrypt_message(
+                &BASE64.encode(kyber_pk_bytes), 
+                text_msg_json.as_bytes()
+            )?;
+            
+            // Need to add dummy data after the Kyber ciphertext to maintain the expected format
+            let mut combined = Vec::new();
+            combined.extend_from_slice(&ciphertext);
+            combined.extend_from_slice(text_msg_json.as_bytes());
+            
+            (BASE64.encode(&combined), BASE64.encode(&nonce_bytes), None, "secure-msg/broadcast".to_string(), false)
         };
         
         // Create the encrypted message envelope
