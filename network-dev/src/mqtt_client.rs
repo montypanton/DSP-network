@@ -318,28 +318,7 @@ impl MqttMessenger {
                     
                     // Fall back to Kyber encryption for this message
                     let (ciphertext, nonce_bytes) = self.crypto.encrypt_message(&recipient_info.public_key, text_msg_json.as_bytes())?;
-                    
-                    // Combine ciphertext and encrypted data
-                    let mut combined = Vec::new();
-                    combined.extend_from_slice(&ciphertext);
-                    
-                    // Add encrypted data
-                    let encrypted_data_nonce = Nonce::from_slice(&nonce_bytes);
-                    
-                    // Create a dummy AEAD key for the initial message
-                    let mut aead_key_bytes = [0u8; 32];
-                    OsRng.fill_bytes(&mut aead_key_bytes);
-                    let aead_key = Key::from_slice(&aead_key_bytes);
-                    let cipher = ChaCha20Poly1305::new(aead_key);
-                    
-                    if let Ok(encrypted) = cipher.encrypt(encrypted_data_nonce, text_msg_json.as_bytes()) {
-                        combined.extend_from_slice(&encrypted);
-                    } else {
-                        // Fallback if encryption fails
-                        combined.extend_from_slice(text_msg_json.as_bytes());
-                    }
-                    
-                    (combined, None)
+                    (ciphertext, None)
                 }
             };
             

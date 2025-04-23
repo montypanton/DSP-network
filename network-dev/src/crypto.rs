@@ -59,8 +59,15 @@ impl CryptoContext {
         // Decode the recipient's public key
         let recipient_public_key_bytes = BASE64.decode(recipient_public_key_b64)
             .map_err(|_| "Invalid public key encoding".to_string())?;
-            
-        // FIXED: Correctly parse the public key based on the expected size
+        
+        // Make sure we have the correct key size for Kyber768
+        if recipient_public_key_bytes.len() != kyber768::public_key_bytes() {
+            return Err(format!("Invalid public key size: {} bytes, expected {}", 
+                             recipient_public_key_bytes.len(), 
+                             kyber768::public_key_bytes()));
+        }
+        
+        // Create the PublicKey directly from bytes without trying to convert to GenericArray
         let recipient_public_key = match PublicKey::from_bytes(&recipient_public_key_bytes) {
             Ok(pk) => pk,
             Err(_) => return Err("Invalid public key format".to_string()),
@@ -70,7 +77,7 @@ impl CryptoContext {
         let (ciphertext, shared_secret) = kyber768::encapsulate(&recipient_public_key);
         
         // Use the shared secret to create a ChaCha20-Poly1305 key
-        let aead_key = Key::from_slice(shared_secret.as_bytes());
+        let aead_key = Key::from_slice(&shared_secret.as_bytes());
         let cipher = ChaCha20Poly1305::new(aead_key);
         
         // Generate a random nonce
@@ -78,14 +85,16 @@ impl CryptoContext {
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
         
-        // Encrypt the message - fix the unused variable warning by ignoring it with _
-        let _encrypted_data = cipher.encrypt(nonce, message)
+        // Encrypt the message
+        let encrypted_data = cipher.encrypt(nonce, message)
             .map_err(|e| format!("Encryption failed: {}", e))?;
         
-        // Return the ciphertext and nonce separately
-        let ciphertext_bytes = ciphertext.as_bytes().to_vec();
+        // Create the combined output
+        let mut result = Vec::new();
+        result.extend_from_slice(ciphertext.as_bytes());
+        result.extend_from_slice(&encrypted_data);
         
-        Ok((ciphertext_bytes, nonce_bytes.to_vec()))
+        Ok((result, nonce_bytes.to_vec()))
     }
     
     // Decrypt a message using Kyber and ChaCha20-Poly1305
