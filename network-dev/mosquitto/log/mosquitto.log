@@ -278,3 +278,22 @@
 1745581110: New client connected from 192.168.65.1:62998 as secure-msg-6dd70744f1698fb2df0abf85e8dbe9fb (p2, c1, k30).
 1745581125: New connection from 192.168.65.1:35641 on port 1883.
 1745581125: New client connected from 192.168.65.1:35641 as secure-msg-239acf34a44ad11924a64d5d13522c40 (p2, c1, k30).
+1745581207: Client secure-msg-6dd70744f1698fb2df0abf85e8dbe9fb closed its connection.
+1745581469: New connection from 192.168.65.1:48730 on port 1883.
+1745581469: New client connected from 192.168.65.1:48730 as secure-msg-43807660627d8d300517aef83de0dd5d (p2, c1, k30).
+1745581474: Client secure-msg-239acf34a44ad11924a64d5d13522c40 closed its connection.
+1745581476: New connection from 192.168.65.1:60224 on port 1883.
+1745581476: New client connected from 192.168.65.1:60224 as secure-msg-d52a9b60c299151e651457577ea15f11 (p2, c1, k30).
+1745581488: Client secure-msg-d52a9b60c299151e651457577ea15f11 closed its connection.
+1745581490: New connection from 192.168.65.1:19309 on port 1883.
+1745581490: New client connected from 192.168.65.1:19309 as secure-msg-cc3d7e449d73ce0e525210a6dd8498c7 (p2, c1, k30).
+1745581507: Client secure-msg-43807660627d8d300517aef83de0dd5d closed its connection.
+1745581510: Client secure-msg-cc3d7e449d73ce0e525210a6dd8498c7 closed its connection.
+1745581514: New connection from 192.168.65.1:51514 on port 1883.
+1745581514: New client connected from 192.168.65.1:51514 as secure-msg-489d31ef5ad51c7544ebdf6a95207dd3 (p2, c1, k30).
+1745581516: New connection from 192.168.65.1:33028 on port 1883.
+1745581516: New client connected from 192.168.65.1:33028 as secure-msg-9a78c200297efa4fa876f64f329c4eb0 (p2, c1, k30).
+1745581663: Client secure-msg-9a78c200297efa4fa876f64f329c4eb0 closed its connection.
+1745581664: Client secure-msg-489d31ef5ad51c7544ebdf6a95207dd3 closed its connection.
+1745582901: Saving in-memory database to /mosquitto/data//mosquitto.db.
+1745584702: Saving in-memory database to /mosquitto/data//mosquitto.db.

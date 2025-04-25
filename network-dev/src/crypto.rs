@@ -8,6 +8,7 @@ use x25519_dalek::{EphemeralSecret, PublicKey as X25519Public};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::message::{DeviceInfo, SessionKeys};
 
@@ -17,6 +18,11 @@ pub struct CryptoContext {
     pub kyber_secret_key: SecretKey,
     pub kyber_public_key: PublicKey,
     pub session_keys: Arc<Mutex<HashMap<String, SessionKeys>>>,
+    // New fields for key rotation tracking
+    pub messages_since_rotation: Arc<Mutex<HashMap<String, usize>>>,
+    pub rotation_interval: usize, // Number of messages before key rotation
+    pub last_rotation_time: Arc<Mutex<HashMap<String, u64>>>, // Timestamp of last rotation
+    pub time_rotation_interval: u64, // Seconds between time-based rotations
 }
 
 impl CryptoContext {
@@ -34,7 +40,17 @@ impl CryptoContext {
             kyber_secret_key,
             kyber_public_key,
             session_keys: Arc::new(Mutex::new(HashMap::new())),
+            messages_since_rotation: Arc::new(Mutex::new(HashMap::new())),
+            rotation_interval: 10, // Rotate keys every 10 messages by default
+            last_rotation_time: Arc::new(Mutex::new(HashMap::new())),
+            time_rotation_interval: 300, // Rotate keys every 5 minutes by default
         }
+    }
+    
+    // Method to configure key rotation settings
+    pub fn configure_rotation(&mut self, message_interval: usize, time_interval_secs: u64) {
+        self.rotation_interval = message_interval;
+        self.time_rotation_interval = time_interval_secs;
     }
     
     // Create a device info object for sharing
@@ -171,12 +187,109 @@ impl CryptoContext {
             println!("Created new session with {}", recipient_id);
         }
         
+        // Reset rotation counters
+        {
+            let mut counters = self.messages_since_rotation.lock().unwrap();
+            counters.insert(recipient_id.to_string(), 0);
+        }
+        
+        {
+            let mut times = self.last_rotation_time.lock().unwrap();
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            times.insert(recipient_id.to_string(), now);
+        }
+        
         Ok(ephemeral_public)
+    }
+    
+    // Check if key rotation is needed and perform if necessary
+    pub fn check_key_rotation(&self, recipient_id: &str) -> Result<Option<X25519Public>, String> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        let should_rotate_by_count;
+        let should_rotate_by_time;
+        
+        // Check message count-based rotation
+        {
+            let mut counts = self.messages_since_rotation.lock().unwrap();
+            let count = counts.entry(recipient_id.to_string()).or_insert(0);
+            *count += 1;
+            should_rotate_by_count = *count >= self.rotation_interval;
+            
+            if should_rotate_by_count {
+                *count = 0; // Reset counter if we're going to rotate
+            }
+        }
+        
+        // Check time-based rotation
+        {
+            let mut last_times = self.last_rotation_time.lock().unwrap();
+            let last_time = last_times.entry(recipient_id.to_string()).or_insert(now);
+            should_rotate_by_time = now - *last_time >= self.time_rotation_interval;
+            
+            if should_rotate_by_time {
+                *last_time = now; // Update last rotation time
+            }
+        }
+        
+        // If either condition is met, rotate keys
+        if should_rotate_by_count || should_rotate_by_time {
+            // First check if we have an active session
+            let has_session = {
+                let sessions = self.session_keys.lock().unwrap();
+                sessions.contains_key(recipient_id)
+            };
+            
+            if has_session {
+                // Use the Device info to get their ephemeral key
+                // This would normally go through DeviceManager but we'll simplify
+                // by generating a new session directly
+                return self.rotate_keys(recipient_id);
+            }
+        }
+        
+        Ok(None)
+    }
+    
+    // Rotate keys for a session - simplified version that generates new key directly
+    pub fn rotate_keys(&self, recipient_id: &str) -> Result<Option<X25519Public>, String> {
+        // We'll need an active session to rotate
+        let has_session = {
+            let sessions = self.session_keys.lock().unwrap();
+            sessions.contains_key(recipient_id)
+        };
+        
+        if !has_session {
+            return Err(format!("No active session with {}", recipient_id));
+        }
+        
+        // Generate a new ephemeral keypair 
+        let (ephemeral_secret, ephemeral_public) = self.generate_ephemeral_keypair();
+        
+        // Update the session counter
+        {
+            let mut counters = self.messages_since_rotation.lock().unwrap();
+            counters.insert(recipient_id.to_string(), 0);
+        }
+        
+        // Update rotation time
+        {
+            let mut times = self.last_rotation_time.lock().unwrap();
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            times.insert(recipient_id.to_string(), now);
+        }
+        
+        println!("Generated new key for rotation with {}", recipient_id);
+        
+        // Return the public key to be sent
+        Ok(Some(ephemeral_public))
     }
     
     // Encrypt a message using the forward secrecy session
     pub fn encrypt_with_session(&self, recipient_id: &str, message: &[u8]) -> Result<(Vec<u8>, Option<X25519Public>), String> {
-        let should_refresh = false;
         let shared_secret;
         
         // Get the current session key
@@ -184,9 +297,6 @@ impl CryptoContext {
             let sessions = self.session_keys.lock().unwrap();
             if let Some(session) = sessions.get(recipient_id) {
                 shared_secret = session.shared_secret.clone();
-                // Decide if we should refresh the key (e.g., every 10 messages)
-                // This is a simplified approach - in a real system, you'd use a more sophisticated key rotation policy
-                // should_refresh = rand::random::<u8>() < 20; // ~8% chance of refreshing
             } else {
                 return Err(format!("No session established with {}", recipient_id));
             }
@@ -205,12 +315,13 @@ impl CryptoContext {
         let encrypted_data = cipher.encrypt(nonce, message)
             .map_err(|e| format!("Encryption failed: {}", e))?;
         
-        // If we should refresh, generate a new ephemeral key
-        let new_ephemeral = if should_refresh {
-            let (_, public) = self.generate_ephemeral_keypair();
-            Some(public)
-        } else {
-            None
+        // Check if we need to rotate keys and get new ephemeral public if so
+        let new_ephemeral = match self.check_key_rotation(recipient_id) {
+            Ok(maybe_public) => maybe_public,
+            Err(e) => {
+                println!("Warning: Key rotation check failed: {}", e);
+                None
+            }
         };
         
         // Combine nonce and encrypted data
@@ -235,8 +346,6 @@ impl CryptoContext {
         let sessions = self.session_keys.lock().unwrap();
         
         if let Some(session) = sessions.get(sender_id) {
-            println!("Found session for {}", sender_id);
-            
             // Try the current key first
             let aead_key = Key::from_slice(&session.shared_secret[0..32]);
             let cipher = ChaCha20Poly1305::new(aead_key);
@@ -244,11 +353,9 @@ impl CryptoContext {
             
             match cipher.decrypt(nonce, ciphertext) {
                 Ok(plaintext) => {
-                    println!("Decryption successful with current key");
                     return Ok(plaintext);
                 },
                 Err(_) => {
-                    println!("Current key failed, trying previous keys");
                     // Try previous keys
                     for (idx, prev_secret) in session.previous_secrets.iter().enumerate() {
                         let prev_key = Key::from_slice(&prev_secret[0..32]);

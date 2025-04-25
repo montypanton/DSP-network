@@ -1,22 +1,25 @@
 use crate::crypto::CryptoContext;
+use crate::device::DeviceManager;
 use crate::message::{DeviceInfo, EncryptedMessage, MessageType, TextMessage};
 use rumqttc::{Client, MqttOptions, QoS, Event, Packet};
 use std::time::Duration;
 use std::thread;
 use std::sync::{Arc, Mutex};
+use std::io::{self, Write};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde_json;
 use chrono::Utc;
 use pqcrypto_traits::kem::PublicKey as PQPublicKey;
+use colored::Colorize;
 
 #[derive(Clone)]
 pub struct MqttMessenger {
-    device_id: String,
-    client: Arc<Mutex<Client>>,
-    crypto: Arc<CryptoContext>,
-    display_name: String,
-    known_devices: Arc<Mutex<Vec<DeviceInfo>>>,
-    message_callback: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + 'static>>>>,
+    pub device_id: String,
+    pub client: Arc<Mutex<Client>>,
+    pub crypto: Arc<CryptoContext>,
+    pub display_name: String,
+    pub known_devices: Arc<Mutex<Vec<DeviceInfo>>>,
+    pub message_callback: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + 'static>>>>,
 }
 
 impl MqttMessenger {
@@ -97,10 +100,12 @@ impl MqttMessenger {
                     Ok(Ok(Event::Incoming(Packet::Publish(publish)))) => {
                         // Process received message
                         if let Ok(enc_message) = serde_json::from_slice::<EncryptedMessage>(&publish.payload) {
-                            // Debug log
-                            println!("Message received from {} (type: {:?})", 
-                                    enc_message.sender_id, 
-                                    enc_message.message_type);
+                            // Debug log in a non-blocking way
+                            if enc_message.message_type != MessageType::DeviceAnnounce {
+                                println!("\rMessage received from {} (type: {:?})", 
+                                        enc_message.sender_id, 
+                                        enc_message.message_type);
+                            }
                             
                             // If this is a discovery request, respond with our device info
                             let topic = publish.topic.clone();
@@ -158,12 +163,16 @@ impl MqttMessenger {
                         // Handle other event types if needed
                     },
                     Ok(Err(conn_err)) => {
-                        eprintln!("Connection error: {:?}", conn_err);
+                        eprintln!("\rConnection error: {:?}", conn_err);
+                        print!("\r> ");
+                        io::stdout().flush().ok();
                         // Try to reconnect after a delay
                         thread::sleep(Duration::from_secs(5));
                     },
                     Err(recv_err) => {
-                        eprintln!("Receive error: {:?}", recv_err);
+                        eprintln!("\rReceive error: {:?}", recv_err);
+                        print!("\r> ");
+                        io::stdout().flush().ok();
                         // Try to reconnect after a delay
                         thread::sleep(Duration::from_secs(5));
                     }
@@ -177,7 +186,7 @@ impl MqttMessenger {
         Ok(messenger)
     }
     
-    // Process a received message
+    // Process a received message without blocking the main thread
     fn process_message(
         crypto: &CryptoContext,
         enc_message: &EncryptedMessage,
@@ -197,7 +206,12 @@ impl MqttMessenger {
             }
         }
         
-        println!("Processing message type: {:?} from {}", enc_message.message_type, enc_message.sender_id);
+        // Debug log - done in a non-blocking way
+        if enc_message.message_type != MessageType::DeviceAnnounce {
+            println!("\rProcessing message type: {:?} from {}", 
+                    enc_message.message_type, 
+                    enc_message.sender_id);
+        }
         
         match enc_message.message_type {
             MessageType::DeviceAnnounce => {
@@ -212,16 +226,16 @@ impl MqttMessenger {
                             devices[idx] = device_info;
                         } else {
                             devices.push(device_info);
-                            println!("New device added to known devices list");
+                            println!("\rNew device added to known devices list");
+                            // Restore the prompt after printing
+                            print!("\r> ");
+                            io::stdout().flush().ok();
                         }
                     }
                 }
             },
             MessageType::TextMessage => {
-                // Process text message
-                // For encrypted messages, we need to decrypt them first
-                println!("Received text message, attempting decryption");
-                
+                // Process text message - in a non-blocking way
                 if let Ok(ct_bytes) = BASE64.decode(&enc_message.encrypted_data) {
                     if let Ok(nonce) = BASE64.decode(&enc_message.nonce) {
                         // Handle forward secrecy
@@ -231,18 +245,13 @@ impl MqttMessenger {
                             }
                         }
                         
-                        // Decryption approaches
+                        // Decryption approaches - same as before
                         let decryption_result = if enc_message.is_initial_kyber && ct_bytes.len() >= 1088 {
-                            // This is an initial Kyber message
-                            println!("Attempting Kyber decryption");
                             crypto.decrypt_message(&ct_bytes[..1088], &nonce, &ct_bytes[1088..])
                         } else if let Some(_) = &enc_message.recipient_id {
-                            // Try session-based decryption first for direct messages
-                            println!("Attempting session decryption");
                             match crypto.decrypt_with_session(&enc_message.sender_id, &ct_bytes) {
                                 Ok(plaintext) => Ok(plaintext),
-                                Err(e) => {
-                                    println!("Session decryption failed: {}, trying Kyber fallback", e);
+                                Err(_e) => {
                                     if ct_bytes.len() >= 1088 {
                                         crypto.decrypt_message(&ct_bytes[..1088], &nonce, &ct_bytes[1088..])
                                     } else {
@@ -251,7 +260,6 @@ impl MqttMessenger {
                                 }
                             }
                         } else {
-                            // Broadcast message - decrypt with Kyber
                             if ct_bytes.len() >= 1088 {
                                 crypto.decrypt_message(&ct_bytes[..1088], &nonce, &ct_bytes[1088..])
                             } else {
@@ -263,28 +271,46 @@ impl MqttMessenger {
                             Ok(decrypted) => {
                                 match serde_json::from_slice::<TextMessage>(&decrypted) {
                                     Ok(text_msg) => {
-                                        println!("Successfully decrypted message from {}", text_msg.from_name);
-                                        // Call the callback with the decrypted message
                                         if let Some(cb) = &*callback.lock().unwrap() {
+                                            // Clear the current line before displaying the message
+                                            print!("\r\x1B[K"); // Clear the current line
                                             cb(text_msg.from_name, text_msg.content);
+                                            // Restore the prompt after the message callback
+                                            print!("\r> ");
+                                            io::stdout().flush().ok();
                                         }
                                     },
-                                    Err(e) => println!("Failed to parse decrypted message: {}", e)
+                                    Err(e) => {
+                                        println!("\rFailed to parse decrypted message: {}", e);
+                                        print!("\r> ");
+                                        io::stdout().flush().ok();
+                                    }
                                 }
                             },
-                            Err(e) => println!("Failed to decrypt message: {}", e)
+                            Err(e) => {
+                                println!("\rFailed to decrypt message: {}", e);
+                                print!("\r> ");
+                                io::stdout().flush().ok();
+                            }
                         }
                     }
                 }
             },
             MessageType::KeyExchange => {
                 // Process key exchange message
-                println!("Received key exchange message");
                 if let Some(ephemeral_key) = &enc_message.ephemeral_public {
                     if let Ok(key_bytes) = BASE64.decode(ephemeral_key) {
                         match crypto.handle_ephemeral_key(&enc_message.sender_id, &key_bytes) {
-                            Ok(_) => println!("Established forward secrecy session with {}", enc_message.sender_id),
-                            Err(e) => println!("Failed to establish session: {}", e)
+                            Ok(_) => {
+                                println!("\rEstablished forward secrecy session with {}", enc_message.sender_id);
+                                print!("\r> ");
+                                io::stdout().flush().ok();
+                            },
+                            Err(e) => {
+                                println!("\rFailed to establish session: {}", e);
+                                print!("\r> ");
+                                io::stdout().flush().ok();
+                            }
                         }
                     }
                 }
@@ -402,7 +428,10 @@ impl MqttMessenger {
                 .map_err(|_| "Invalid ephemeral key encoding".to_string())?;
             
             // Create a session on our side too
-            self.crypto.handle_ephemeral_key(recipient_id, &ephemeral_bytes)?;
+            let _ = self.crypto.handle_ephemeral_key(recipient_id, &ephemeral_bytes)?;
+            
+            // We no longer try to use DeviceManager here to avoid the error
+            // DeviceManager functionality is handled within the known_devices list
         }
         
         Ok(())
@@ -444,8 +473,6 @@ impl MqttMessenger {
                         vec![0u8; 12]
                     };
                     
-                    println!("Encrypted message with session keys for {}", recipient);
-                    
                     // Set up the ephemeral key for the message if we have one
                     let eph_key = eph.map(|k| BASE64.encode(k.as_bytes()));
                     
@@ -453,7 +480,9 @@ impl MqttMessenger {
                      format!("secure-msg/device/{}", recipient), false)
                 },
                 Err(e) => {
-                    println!("Session encryption failed: {}, falling back to Kyber", e);
+                    println!("\rSession encryption failed: {}, falling back to Kyber", e);
+                    print!("\r> ");
+                    io::stdout().flush().ok();
                     
                     // No session yet, fall back to Kyber encryption
                     let (ciphertext, nonce_bytes) = self.crypto.encrypt_message(&recipient_info.public_key, text_msg_json.as_bytes())?;
@@ -464,7 +493,9 @@ impl MqttMessenger {
             }
         } else {
             // Broadcast message - use Kyber with our own public key
-            println!("Preparing broadcast message");
+            println!("\rPreparing broadcast message");
+            print!("\r> ");
+            io::stdout().flush().ok();
             
             // Get encoded version of our Kyber public key
             let kyber_pk_bytes = self.crypto.kyber_public_key.as_bytes();

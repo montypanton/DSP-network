@@ -1,5 +1,5 @@
 use crate::message::DeviceInfo;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -8,11 +8,26 @@ pub struct DeviceManager {
     last_seen: Arc<Mutex<HashMap<String, u64>>>,
 }
 
+// Static instance for singleton pattern
+static mut INSTANCE: Option<Arc<DeviceManager>> = None;
+static INIT: Once = Once::new();
+
 impl DeviceManager {
     pub fn new() -> Self {
         Self {
             known_devices: Arc::new(Mutex::new(HashMap::new())),
             last_seen: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+    
+    // Get the singleton instance
+    pub fn get_instance() -> Arc<DeviceManager> {
+        unsafe {
+            INIT.call_once(|| {
+                INSTANCE = Some(Arc::new(DeviceManager::new()));
+            });
+            
+            INSTANCE.clone().unwrap()
         }
     }
     
@@ -44,7 +59,7 @@ impl DeviceManager {
         devices.get(device_id).cloned()
     }
     
-    // Clean up devices that haven't been seen in a while
+    // Update the MQTT messenger to use the device manager singleton
     pub fn cleanup_inactive_devices(&self, inactive_threshold_secs: u64) {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let mut to_remove = Vec::new();
