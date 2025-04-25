@@ -15,12 +15,14 @@ fn enter_chat_mode(messenger_arc: Arc<Mutex<mqtt_client::MqttMessenger>>, recipi
     {
         let mut messenger = messenger_arc.lock().unwrap();
         let recipient_id_copy = recipient_id.to_string();
+        let recipient_name_copy = recipient_name.to_string();
+
         messenger.set_message_callback(move |sender, message| {
             // Only show messages from our chat partner
-            if sender.contains(&recipient_id_copy) || sender == recipient_name {
+            if sender.contains(&recipient_id_copy) || sender == recipient_name_copy {
                 println!("\r\x1B[K{}: {}", sender.yellow(), message);
             }
-            print!("\r[Chat with {}]> ", recipient_name.yellow());
+            print!("\r[Chat with {}]> ", recipient_name_copy.yellow());
             io::stdout().flush().unwrap();
         });
     }
