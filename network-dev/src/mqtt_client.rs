@@ -410,7 +410,7 @@ impl MqttMessenger {
         drop(devices);
             
         // Generate an ephemeral keypair for our side of the key exchange
-        let (ephemeral_secret, public) = self.crypto.generate_ephemeral_keypair();
+        let (_, public) = self.crypto.generate_ephemeral_keypair();
         let ephemeral_key_b64 = BASE64.encode(public.as_bytes());
         
         // Create a key exchange message to establish forward secrecy
@@ -438,17 +438,17 @@ impl MqttMessenger {
         ).map_err(|e| format!("Publish error: {:?}", e))?;
         
         // Also create a session on our side if the recipient has already shared their ephemeral key
-        if let Some(ephemeral_key) = &enc_message.ephemeral_public {
-            if let Ok(key_bytes) = BASE64.decode(ephemeral_key) {
-                // Process the ephemeral key first to update our session
-                match crypto.handle_ephemeral_key(&enc_message.sender_id, &key_bytes) {
+        if let Some(recipient_ephemeral_key) = &recipient.ephemeral_key {
+            if let Ok(key_bytes) = BASE64.decode(recipient_ephemeral_key) {
+                // Process the ephemeral key to create our session
+                match self.crypto.create_forward_secrecy_session(recipient_id, &key_bytes) {
                     Ok(_) => {
-                        println!("\rUpdated session with new ephemeral key from {}", enc_message.sender_id);
-                        // Important: Give time for the key exchange to complete before trying to decrypt
+                        println!("\rCreated session with ephemeral key from {}", recipient_id);
+                        // Give time for the key exchange to complete
                         thread::sleep(Duration::from_millis(10));
                     },
                     Err(e) => {
-                        println!("\rWarning: Failed to handle ephemeral key: {}", e);
+                        println!("\rWarning: Failed to create session: {}", e);
                     }
                 }
             }

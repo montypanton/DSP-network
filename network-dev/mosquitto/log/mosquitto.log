@@ -425,3 +425,7 @@
 1745598017: New client connected from 192.168.65.1:60291 as secure-msg-a22cca36e5c13bbdba7dd14e42905a2c (p2, c1, k30).
 1745598713: Client secure-msg-a22cca36e5c13bbdba7dd14e42905a2c closed its connection.
 1745598717: Client secure-msg-f522a21f1ae1f7bc299c18118921a534 closed its connection.
+1745599202: New connection from 192.168.65.1:43211 on port 1883.
+1745599202: New client connected from 192.168.65.1:43211 as secure-msg-cfdf0df0427c3f5db1c93039361c7b42 (p2, c1, k30).
+1745599206: New connection from 192.168.65.1:19594 on port 1883.
+1745599206: New client connected from 192.168.65.1:19594 as secure-msg-e1aceb8685a4d1db685c81059c560fe7 (p2, c1, k30).
