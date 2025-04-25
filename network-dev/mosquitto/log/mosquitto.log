@@ -333,3 +333,93 @@
 1745587936: New client connected from 192.168.65.1:51365 as secure-msg-d07ecbd9e12a2b9ec42ff2a0dc809958 (p2, c1, k30).
 1745587940: New connection from 192.168.65.1:47704 on port 1883.
 1745587940: New client connected from 192.168.65.1:47704 as secure-msg-8616cbb52efb3dffac81955d17cca319 (p2, c1, k30).
+1745588215: Client secure-msg-d07ecbd9e12a2b9ec42ff2a0dc809958 closed its connection.
+1745588218: New connection from 192.168.65.1:24027 on port 1883.
+1745588218: New client connected from 192.168.65.1:24027 as secure-msg-4b2b076d162da49123df71ff17073c90 (p2, c1, k30).
+1745588383: Saving in-memory database to /mosquitto/data//mosquitto.db.
+1745589018: Client secure-msg-4b2b076d162da49123df71ff17073c90 has exceeded timeout, disconnecting.
+1745589018: Client secure-msg-8616cbb52efb3dffac81955d17cca319 has exceeded timeout, disconnecting.
+1745589023: New connection from 192.168.65.1:18518 on port 1883.
+1745589023: New connection from 192.168.65.1:54173 on port 1883.
+1745589023: New client connected from 192.168.65.1:18518 as secure-msg-4b2b076d162da49123df71ff17073c90 (p2, c1, k30).
+1745589023: New client connected from 192.168.65.1:54173 as secure-msg-8616cbb52efb3dffac81955d17cca319 (p2, c1, k30).
+1745589249: Client secure-msg-4b2b076d162da49123df71ff17073c90 closed its connection.
+1745589252: New connection from 192.168.65.1:62638 on port 1883.
+1745589252: New client connected from 192.168.65.1:62638 as secure-msg-377011b301019b47528fb67e3b5e8f08 (p2, c1, k30).
+1745589254: Client secure-msg-8616cbb52efb3dffac81955d17cca319 closed its connection.
+1745589256: New connection from 192.168.65.1:40501 on port 1883.
+1745589256: New client connected from 192.168.65.1:40501 as secure-msg-d0087371a07832695db3a378c9fc3c19 (p2, c1, k30).
+1745589371: Client secure-msg-377011b301019b47528fb67e3b5e8f08 closed its connection.
+1745589373: Client secure-msg-d0087371a07832695db3a378c9fc3c19 closed its connection.
+1745590184: Saving in-memory database to /mosquitto/data//mosquitto.db.
+1745591542: New connection from 192.168.65.1:54803 on port 1883.
+1745591542: New client connected from 192.168.65.1:54803 as secure-msg-693d731aeb3c965c23e802fef603cc60 (p2, c1, k30).
+1745591547: New connection from 192.168.65.1:57798 on port 1883.
+1745591547: New client connected from 192.168.65.1:57798 as secure-msg-8e812d11e01d7c251b56ad14843b7ca2 (p2, c1, k30).
+1745591942: Client secure-msg-8e812d11e01d7c251b56ad14843b7ca2 closed its connection.
+1745591949: New connection from 192.168.65.1:19255 on port 1883.
+1745591949: New client connected from 192.168.65.1:19255 as secure-msg-c161a0028cb1301ec4b0c5b93f9f23f0 (p2, c1, k30).
+1745591955: Client secure-msg-693d731aeb3c965c23e802fef603cc60 closed its connection.
+1745591959: New connection from 192.168.65.1:52613 on port 1883.
+1745591959: New client connected from 192.168.65.1:52613 as secure-msg-0b170d9516af3cadb98c1443b8ef69a8 (p2, c1, k30).
+1745591985: Saving in-memory database to /mosquitto/data//mosquitto.db.
+1745592598: Client secure-msg-0b170d9516af3cadb98c1443b8ef69a8 has exceeded timeout, disconnecting.
+1745592598: Client secure-msg-c161a0028cb1301ec4b0c5b93f9f23f0 has exceeded timeout, disconnecting.
+1745592603: New connection from 192.168.65.1:29019 on port 1883.
+1745592603: New connection from 192.168.65.1:52240 on port 1883.
+1745592603: New client connected from 192.168.65.1:29019 as secure-msg-c161a0028cb1301ec4b0c5b93f9f23f0 (p2, c1, k30).
+1745592603: New client connected from 192.168.65.1:52240 as secure-msg-0b170d9516af3cadb98c1443b8ef69a8 (p2, c1, k30).
+1745592859: Client secure-msg-0b170d9516af3cadb98c1443b8ef69a8 has exceeded timeout, disconnecting.
+1745592859: Client secure-msg-c161a0028cb1301ec4b0c5b93f9f23f0 has exceeded timeout, disconnecting.
+1745592864: New connection from 192.168.65.1:45035 on port 1883.
+1745592864: New connection from 192.168.65.1:54886 on port 1883.
+1745592864: New client connected from 192.168.65.1:45035 as secure-msg-c161a0028cb1301ec4b0c5b93f9f23f0 (p2, c1, k30).
+1745592864: New client connected from 192.168.65.1:54886 as secure-msg-0b170d9516af3cadb98c1443b8ef69a8 (p2, c1, k30).
+1745593487: Client secure-msg-0b170d9516af3cadb98c1443b8ef69a8 has exceeded timeout, disconnecting.
+1745593487: Client secure-msg-c161a0028cb1301ec4b0c5b93f9f23f0 has exceeded timeout, disconnecting.
+1745593492: New connection from 192.168.65.1:55487 on port 1883.
+1745593492: New connection from 192.168.65.1:22666 on port 1883.
+1745593492: New client connected from 192.168.65.1:55487 as secure-msg-0b170d9516af3cadb98c1443b8ef69a8 (p2, c1, k30).
+1745593492: New client connected from 192.168.65.1:22666 as secure-msg-c161a0028cb1301ec4b0c5b93f9f23f0 (p2, c1, k30).
+1745593786: Saving in-memory database to /mosquitto/data//mosquitto.db.
+1745594437: Client secure-msg-0b170d9516af3cadb98c1443b8ef69a8 has exceeded timeout, disconnecting.
+1745594437: Client secure-msg-c161a0028cb1301ec4b0c5b93f9f23f0 has exceeded timeout, disconnecting.
+1745594442: New connection from 192.168.65.1:20599 on port 1883.
+1745594442: New client connected from 192.168.65.1:20599 as secure-msg-c161a0028cb1301ec4b0c5b93f9f23f0 (p2, c1, k30).
+1745594442: New connection from 192.168.65.1:53782 on port 1883.
+1745594442: New client connected from 192.168.65.1:53782 as secure-msg-0b170d9516af3cadb98c1443b8ef69a8 (p2, c1, k30).
+1745594992: Client secure-msg-0b170d9516af3cadb98c1443b8ef69a8 has exceeded timeout, disconnecting.
+1745594992: Client secure-msg-c161a0028cb1301ec4b0c5b93f9f23f0 has exceeded timeout, disconnecting.
+1745594997: New connection from 192.168.65.1:60926 on port 1883.
+1745594997: New client connected from 192.168.65.1:60926 as secure-msg-c161a0028cb1301ec4b0c5b93f9f23f0 (p2, c1, k30).
+1745594997: New connection from 192.168.65.1:21490 on port 1883.
+1745594997: New client connected from 192.168.65.1:21490 as secure-msg-0b170d9516af3cadb98c1443b8ef69a8 (p2, c1, k30).
+1745595079: Client secure-msg-0b170d9516af3cadb98c1443b8ef69a8 has exceeded timeout, disconnecting.
+1745595084: New connection from 192.168.65.1:59658 on port 1883.
+1745595084: New client connected from 192.168.65.1:59658 as secure-msg-0b170d9516af3cadb98c1443b8ef69a8 (p2, c1, k30).
+1745595145: Client secure-msg-0b170d9516af3cadb98c1443b8ef69a8 has exceeded timeout, disconnecting.
+1745595147: Client secure-msg-c161a0028cb1301ec4b0c5b93f9f23f0 has exceeded timeout, disconnecting.
+1745595150: New connection from 192.168.65.1:60769 on port 1883.
+1745595150: New client connected from 192.168.65.1:60769 as secure-msg-0b170d9516af3cadb98c1443b8ef69a8 (p2, c1, k30).
+1745595152: New connection from 192.168.65.1:41956 on port 1883.
+1745595152: New client connected from 192.168.65.1:41956 as secure-msg-c161a0028cb1301ec4b0c5b93f9f23f0 (p2, c1, k30).
+1745596052: Saving in-memory database to /mosquitto/data//mosquitto.db.
+1745596052: Client secure-msg-0b170d9516af3cadb98c1443b8ef69a8 has exceeded timeout, disconnecting.
+1745596052: Client secure-msg-c161a0028cb1301ec4b0c5b93f9f23f0 has exceeded timeout, disconnecting.
+1745596057: New connection from 192.168.65.1:36548 on port 1883.
+1745596057: New connection from 192.168.65.1:60799 on port 1883.
+1745596057: New client connected from 192.168.65.1:36548 as secure-msg-0b170d9516af3cadb98c1443b8ef69a8 (p2, c1, k30).
+1745596057: New client connected from 192.168.65.1:60799 as secure-msg-c161a0028cb1301ec4b0c5b93f9f23f0 (p2, c1, k30).
+1745596762: Client secure-msg-0b170d9516af3cadb98c1443b8ef69a8 has exceeded timeout, disconnecting.
+1745596762: Client secure-msg-c161a0028cb1301ec4b0c5b93f9f23f0 has exceeded timeout, disconnecting.
+1745596767: New connection from 192.168.65.1:64082 on port 1883.
+1745596767: New connection from 192.168.65.1:65497 on port 1883.
+1745596767: New client connected from 192.168.65.1:64082 as secure-msg-c161a0028cb1301ec4b0c5b93f9f23f0 (p2, c1, k30).
+1745596767: New client connected from 192.168.65.1:65497 as secure-msg-0b170d9516af3cadb98c1443b8ef69a8 (p2, c1, k30).
+1745597853: Saving in-memory database to /mosquitto/data//mosquitto.db.
+1745598006: Client secure-msg-c161a0028cb1301ec4b0c5b93f9f23f0 closed its connection.
+1745598009: Client secure-msg-0b170d9516af3cadb98c1443b8ef69a8 closed its connection.
+1745598015: New connection from 192.168.65.1:40185 on port 1883.
+1745598015: New client connected from 192.168.65.1:40185 as secure-msg-f522a21f1ae1f7bc299c18118921a534 (p2, c1, k30).
+1745598017: New connection from 192.168.65.1:60291 on port 1883.
+1745598017: New client connected from 192.168.65.1:60291 as secure-msg-a22cca36e5c13bbdba7dd14e42905a2c (p2, c1, k30).

@@ -150,6 +150,7 @@ impl MqttMessenger {
                                 }
                             }
                             
+                            // Process the message - critically important to handle ephemeral keys FIRST
                             Self::process_message(
                                 &*thread_crypto,
                                 &enc_message,
@@ -215,7 +216,7 @@ impl MqttMessenger {
         
         match enc_message.message_type {
             MessageType::DeviceAnnounce => {
-                // Process device announce message - no changes needed here
+                // Process device announce message
                 if let Ok(device_info_bytes) = BASE64.decode(&enc_message.encrypted_data) {
                     if let Ok(device_info) = serde_json::from_slice::<DeviceInfo>(&device_info_bytes) {
                         let mut devices = known_devices.lock().unwrap();
@@ -234,22 +235,54 @@ impl MqttMessenger {
                     }
                 }
             },
+            MessageType::KeyExchange => {
+                // Process key exchange message FIRST - this is specifically for forward secrecy
+                // This is critical to do before TextMessage processing to ensure session is established
+                if let Some(ephemeral_key) = &enc_message.ephemeral_public {
+                    if let Ok(key_bytes) = BASE64.decode(ephemeral_key) {
+                        match crypto.handle_ephemeral_key(&enc_message.sender_id, &key_bytes) {
+                            Ok(_) => {
+                                println!("\rEstablished forward secrecy session with {}", enc_message.sender_id);
+                                print!("\r> ");
+                                io::stdout().flush().ok();
+                            },
+                            Err(e) => {
+                                println!("\rFailed to establish session: {}", e);
+                                print!("\r> ");
+                                io::stdout().flush().ok();
+                            }
+                        }
+                    }
+                }
+            },
             MessageType::TextMessage => {
-                // Process text message - this is where we need to fix the decryption logic
+                // Process text message with improved decryption logic
                 if let Ok(ct_bytes) = BASE64.decode(&enc_message.encrypted_data) {
-                    // First, handle forward secrecy if an ephemeral key is present
+                    // CRITICAL FIX: Handle ephemeral key first, if present,
+                    // to update session BEFORE trying to decrypt
+                    let mut used_ephemeral = false;
                     if let Some(ephemeral_key) = &enc_message.ephemeral_public {
                         if let Ok(key_bytes) = BASE64.decode(ephemeral_key) {
-                            let _ = crypto.handle_ephemeral_key(&enc_message.sender_id, &key_bytes);
+                            // Process the ephemeral key first to update our session
+                            match crypto.handle_ephemeral_key(&enc_message.sender_id, &key_bytes) {
+                                Ok(_) => {
+                                    println!("\rUpdated session with ephemeral key from {}", enc_message.sender_id);
+                                    used_ephemeral = true; // Mark that we used a new ephemeral key
+                                },
+                                Err(e) => {
+                                    println!("\rWarning: Failed to handle ephemeral key: {}", e);
+                                }
+                            }
                         }
                     }
                     
-                    // Now handle the decryption with improved flow and error handling
+                    // Now handle the decryption based on message type
                     let decryption_result = if enc_message.is_initial_kyber {
                         // Initial Kyber-based encryption/decryption
                         if let Ok(nonce) = BASE64.decode(&enc_message.nonce) {
+                            // The Kyber ciphertext size is 1088 bytes for Kyber768
                             if ct_bytes.len() >= 1088 {
-                                // Kyber ciphertext is first 1088 bytes, actual encrypted data follows
+                                // Extract the Kyber ciphertext and encrypted data
                                 crypto.decrypt_message(&ct_bytes[..1088], &nonce, &ct_bytes[1088..])
                             } else {
                                 Err(format!("Invalid Kyber ciphertext length: {}", ct_bytes.len()))
@@ -258,7 +291,7 @@ impl MqttMessenger {
                             Err("Invalid nonce encoding".to_string())
                         }
                     } else {
-                        // Session-based encryption (forward secrecy)
+                        // Session-based encryption (AES-GCM) with or without new ephemeral key
                         crypto.decrypt_with_session(&enc_message.sender_id, &ct_bytes)
                     };
                     
@@ -284,27 +317,14 @@ impl MqttMessenger {
                         },
                         Err(e) => {
                             println!("\rFailed to decrypt message: {}", e);
+                            
+                            // If decryption failed, try to re-establish the session
+                            if !enc_message.is_initial_kyber && !used_ephemeral {
+                                println!("\rAttempting to re-establish session with {}", enc_message.sender_id);
+                            }
+                            
                             print!("\r> ");
                             io::stdout().flush().ok();
-                        }
-                    }
-                }
-            },
-            MessageType::KeyExchange => {
-                // Process key exchange message - no changes needed here
-                if let Some(ephemeral_key) = &enc_message.ephemeral_public {
-                    if let Ok(key_bytes) = BASE64.decode(ephemeral_key) {
-                        match crypto.handle_ephemeral_key(&enc_message.sender_id, &key_bytes) {
-                            Ok(_) => {
-                                println!("\rEstablished forward secrecy session with {}", enc_message.sender_id);
-                                print!("\r> ");
-                                io::stdout().flush().ok();
-                            },
-                            Err(e) => {
-                                println!("\rFailed to establish session: {}", e);
-                                print!("\r> ");
-                                io::stdout().flush().ok();
-                            }
                         }
                     }
                 }
@@ -454,13 +474,36 @@ impl MqttMessenger {
                 }
             };
             
-            // Try to use session keys first for forward secrecy
+            // Check if we already have a session established
+            let has_session = {
+                let sessions = self.crypto.session_keys.lock().unwrap();
+                sessions.contains_key(recipient)
+            };
+            
+            // If no session exists, try to establish one first
+            if !has_session {
+                // Try to establish a session if recipient has shared their ephemeral key
+                if let Some(ephemeral_key) = &recipient_info.ephemeral_key {
+                    if let Ok(ephemeral_bytes) = BASE64.decode(ephemeral_key) {
+                        match self.crypto.create_forward_secrecy_session(recipient, &ephemeral_bytes) {
+                            Ok(_) => {
+                                println!("Created forward secrecy session with {}", recipient);
+                            }
+                            Err(e) => {
+                                println!("Warning: Failed to create session: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Try to use session keys first for forward secrecy (AES-256)
             let encryption_result = self.crypto.encrypt_with_session(recipient, text_msg_json.as_bytes());
             
             match encryption_result {
                 Ok((enc, eph)) => {
                     // Successfully encrypted with session keys
-                    println!("\rUsing forward secrecy session for encryption");
+                    println!("\rUsing AES-256 with forward secrecy session for encryption");
                     
                     // No need to extract nonce - it's already included in the encrypted package
                     let eph_key = eph.map(|k| BASE64.encode(k.as_bytes()));
@@ -491,7 +534,7 @@ impl MqttMessenger {
             }
         } else {
             // Broadcast message - use Kyber with our own public key
-            println!("\rPreparing broadcast message");
+            println!("\rPreparing broadcast message using Kyber");
             print!("\r> ");
             io::stdout().flush().ok();
             

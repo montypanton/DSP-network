@@ -1,8 +1,9 @@
 use pqcrypto_kyber::kyber768::{self, PublicKey, SecretKey};
 use pqcrypto_traits::kem::{PublicKey as PQPublicKey, SharedSecret as _, Ciphertext as _};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use chacha20poly1305::aead::Aead;
-use chacha20poly1305::KeyInit;
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
 use rand::{rngs::OsRng, RngCore};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519Public};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -19,7 +20,7 @@ pub struct CryptoContext {
     pub kyber_secret_key: SecretKey,
     pub kyber_public_key: PublicKey,
     pub session_keys: Arc<Mutex<HashMap<String, SessionKeys>>>,
-    // New fields for key rotation tracking
+    // Key rotation tracking
     pub messages_since_rotation: Arc<Mutex<HashMap<String, usize>>>,
     pub rotation_interval: usize, // Number of messages before key rotation
     pub last_rotation_time: Arc<Mutex<HashMap<String, u64>>>, // Timestamp of last rotation
@@ -74,7 +75,7 @@ impl CryptoContext {
         (secret, public)
     }
     
-    // Encrypt a message for a recipient using Kyber for key exchange and ChaCha20-Poly1305 for encryption
+    // Initial key exchange using Kyber for PQC security
     pub fn encrypt_message(&self, recipient_public_key_b64: &str, message: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
         // Decode the recipient's public key
         let recipient_public_key_bytes = BASE64.decode(recipient_public_key_b64)
@@ -97,18 +98,29 @@ impl CryptoContext {
         // Perform Kyber key encapsulation
         let (ciphertext, shared_secret) = kyber768::encapsulate(&recipient_public_key);
         
-        // Use the shared secret to create a ChaCha20-Poly1305 key
-        let aead_key = Key::from_slice(&shared_secret.as_bytes()[0..32]); // Ensure we use the right key size
-        let cipher = ChaCha20Poly1305::new(aead_key);
+        // Use the shared secret to create an AES-256 key
+        // We use SHA-256 to derive a proper 32-byte key from the shared secret
+        let mut context = Context::new(&SHA256);
+        context.update(shared_secret.as_bytes());
+        let digest = context.finish();
+        let key_bytes = digest.as_ref();
         
-        // Generate a random nonce
+        // Create AES-GCM cipher
+        let cipher = match Aes256Gcm::new_from_slice(key_bytes) {
+            Ok(c) => c,
+            Err(_) => return Err("Failed to create AES-256-GCM cipher".to_string()),
+        };
+        
+        // Generate a random nonce (12 bytes for AES-GCM)
         let mut nonce_bytes = [0u8; 12];
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
         
         // Encrypt the message
-        let encrypted_data = cipher.encrypt(nonce, message)
-            .map_err(|e| format!("Encryption failed: {}", e))?;
+        let encrypted_data = match cipher.encrypt(nonce, message) {
+            Ok(ciphertext) => ciphertext,
+            Err(e) => return Err(format!("Encryption failed: {}", e)),
+        };
         
         // Create the combined output
         let mut result = Vec::new();
@@ -118,7 +130,7 @@ impl CryptoContext {
         Ok((result, nonce_bytes.to_vec()))
     }
     
-    // Decrypt a message using Kyber and ChaCha20-Poly1305
+    // Decrypt a message using Kyber and AES-256-GCM
     pub fn decrypt_message(&self, ciphertext: &[u8], nonce: &[u8], encrypted_data: &[u8]) -> Result<Vec<u8>, String> {
         // Convert the ciphertext bytes to a Kyber ciphertext
         let kyber_ciphertext = match kyber768::Ciphertext::from_bytes(ciphertext) {
@@ -133,17 +145,27 @@ impl CryptoContext {
         // Decapsulate the shared secret
         let shared_secret = kyber768::decapsulate(&kyber_ciphertext, &self.kyber_secret_key);
         
-        // Create the ChaCha20-Poly1305 cipher
-        let aead_key = Key::from_slice(&shared_secret.as_bytes()[0..32]);
-        let cipher = ChaCha20Poly1305::new(aead_key);
+        // Derive AES key from shared secret
+        let mut context = Context::new(&SHA256);
+        context.update(shared_secret.as_bytes());
+        let digest = context.finish();
+        let key_bytes = digest.as_ref();
+        
+        // Create the AES cipher
+        let cipher = match Aes256Gcm::new_from_slice(key_bytes) {
+            Ok(c) => c,
+            Err(_) => return Err("Failed to create AES-256-GCM cipher".to_string()),
+        };
         
         // Decrypt the message
         let nonce = Nonce::from_slice(nonce);
-        cipher.decrypt(nonce, encrypted_data)
-            .map_err(|e| format!("Decryption failed: {}", e))
+        match cipher.decrypt(nonce, encrypted_data) {
+            Ok(plaintext) => Ok(plaintext),
+            Err(e) => Err(format!("Decryption failed: {}", e)),
+        }
     }
     
-    // For forward secrecy: Create a new session key using X25519
+    // Create a forward secrecy session using X25519
     pub fn create_forward_secrecy_session(&self, recipient_id: &str, recipient_ephemeral_key: &[u8]) -> Result<X25519Public, String> {
         // Debug output to track key creation
         println!("Creating forward secrecy session with {}", recipient_id);
@@ -154,7 +176,7 @@ impl CryptoContext {
         }
         
         // Generate a new ephemeral keypair
-        let (_ephemeral_secret, ephemeral_public) = self.generate_ephemeral_keypair();
+        let (ephemeral_secret, ephemeral_public) = self.generate_ephemeral_keypair();
         
         // Print debug info
         println!("My ephemeral public key: {}", hex::encode(ephemeral_public.as_bytes()));
@@ -257,9 +279,6 @@ impl CryptoContext {
             };
             
             if has_session {
-                // Use the Device info to get their ephemeral key
-                // This would normally go through DeviceManager but we'll simplify
-                // by generating a new session directly
                 return self.rotate_keys(recipient_id);
             }
         }
@@ -267,7 +286,7 @@ impl CryptoContext {
         Ok(None)
     }
     
-    // Rotate keys for a session - simplified version that generates new key directly
+    // Rotate keys for a session
     pub fn rotate_keys(&self, recipient_id: &str) -> Result<Option<X25519Public>, String> {
         // We'll need an active session to rotate
         let has_session = {
@@ -301,8 +320,10 @@ impl CryptoContext {
         Ok(Some(ephemeral_public))
     }
     
-    // Encrypt a message using the forward secrecy session
+    // Encrypt a message using the forward secrecy session with AES-256
     pub fn encrypt_with_session(&self, recipient_id: &str, message: &[u8]) -> Result<(Vec<u8>, Option<X25519Public>), String> {
+        // Only include ephemeral key if we need to rotate
+        let mut should_include_ephemeral = false;
         let shared_secret;
         
         // Get the current session key
@@ -315,27 +336,40 @@ impl CryptoContext {
             }
         }
         
-        // Use the shared secret to create a ChaCha20-Poly1305 key
-        let aead_key = Key::from_slice(&shared_secret[0..32]);
-        let cipher = ChaCha20Poly1305::new(aead_key);
+        // Use the shared secret to create an AES-256 key
+        // The shared secret from X25519 is already 32 bytes (256 bits)
+        let cipher = match Aes256Gcm::new_from_slice(&shared_secret[0..32]) {
+            Ok(c) => c,
+            Err(_) => return Err("Failed to create AES-256-GCM cipher".to_string()),
+        };
         
         // Generate a random nonce
-        let mut nonce_bytes = [0u8; 12];
+        let mut nonce_bytes = [0u8; 12]; // AES-GCM requires a 12-byte nonce
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
         
         // Encrypt the message
-        let encrypted_data = cipher.encrypt(nonce, message)
-            .map_err(|e| format!("Encryption failed: {}", e))?;
+        let encrypted_data = match cipher.encrypt(nonce, message) {
+            Ok(ciphertext) => ciphertext,
+            Err(e) => return Err(format!("Encryption failed: {}", e)),
+        };
         
         // Check if we need to rotate keys and get new ephemeral public if so
         let new_ephemeral = match self.check_key_rotation(recipient_id) {
-            Ok(maybe_public) => maybe_public,
+            Ok(Some(ephemeral)) => {
+                should_include_ephemeral = true;
+                Some(ephemeral)
+            },
+            Ok(None) => None,
             Err(e) => {
                 println!("Warning: Key rotation check failed: {}", e);
                 None
             }
         };
+        
+        if should_include_ephemeral {
+            println!("Including ephemeral key with message for key rotation");
+        }
         
         // Combine nonce and encrypted data
         let mut result = Vec::new();
@@ -360,9 +394,16 @@ impl CryptoContext {
         
         if let Some(session) = sessions.get(sender_id) {
             // Try the current key first
-            let aead_key = Key::from_slice(&session.shared_secret[0..32]);
-            let cipher = ChaCha20Poly1305::new(aead_key);
             let nonce = Nonce::from_slice(nonce_bytes);
+            
+            // Debug info
+            println!("Attempting decryption with current key (prefix: {})", 
+                    hex::encode(&session.shared_secret[0..4]));
+            
+            let cipher = match Aes256Gcm::new_from_slice(&session.shared_secret[0..32]) {
+                Ok(c) => c,
+                Err(_) => return Err("Failed to create AES-256-GCM cipher".to_string()),
+            };
             
             match cipher.decrypt(nonce, ciphertext) {
                 Ok(plaintext) => {
@@ -372,12 +413,26 @@ impl CryptoContext {
                 Err(_) => {
                     // Try previous keys
                     for (idx, prev_secret) in session.previous_secrets.iter().enumerate() {
-                        let prev_key = Key::from_slice(&prev_secret[0..32]);
-                        let prev_cipher = ChaCha20Poly1305::new(prev_key);
+                        println!("Trying previous key {} (prefix: {})", 
+                                idx, hex::encode(&prev_secret[0..4]));
+                                
+                        let prev_cipher = match Aes256Gcm::new_from_slice(&prev_secret[0..32]) {
+                            Ok(c) => c,
+                            Err(_) => continue, // Skip this key if we can't create a cipher
+                        };
                         
                         if let Ok(plaintext) = prev_cipher.decrypt(nonce, ciphertext) {
                             println!("Decryption successful with previous key {}", idx);
                             return Ok(plaintext);
+                        }
+                    }
+                    
+                    // Add diagnostic information
+                    println!("Current key failed: {}", hex::encode(&session.shared_secret[0..8]));
+                    if !session.previous_secrets.is_empty() {
+                        println!("Previous keys also failed. Available keys:");
+                        for (i, key) in session.previous_secrets.iter().enumerate() {
+                            println!("  Key {}: {}", i, hex::encode(&key[0..8]));
                         }
                     }
                     
@@ -410,7 +465,7 @@ impl CryptoContext {
         combined.extend_from_slice(first_key);
         combined.extend_from_slice(second_key);
         
-        // Use a hash as a key derivation function
+        // Use a hash as a key derivation function for AES-256
         let mut context = Context::new(&SHA256);
         context.update(&combined);
         let digest = context.finish();
@@ -430,7 +485,7 @@ impl CryptoContext {
         }
         
         // Generate our ephemeral keys
-        let (_our_secret, our_public) = self.generate_ephemeral_keypair();
+        let (_, our_public) = self.generate_ephemeral_keypair();
         println!("Our ephemeral public key: {}", hex::encode(our_public.as_bytes()));
         
         // Derive a symmetrical key that will be the same on both sides
@@ -440,15 +495,27 @@ impl CryptoContext {
             their_ephemeral_key
         );
         
+        // First save the original session key if it exists
+        let original_key_opt = {
+            let sessions = self.session_keys.lock().unwrap();
+            if let Some(session) = sessions.get(sender_id) {
+                Some(session.shared_secret.clone())
+            } else {
+                None
+            }
+        };
+        
         // Store the shared key in our session manager
         let mut sessions = self.session_keys.lock().unwrap();
         
         if let Some(session) = sessions.get_mut(sender_id) {
-            // Store previous secret for possible out-of-order messages
-            session.previous_secrets.push(session.shared_secret.clone());
-            if session.previous_secrets.len() > 5 {
-                // Keep only the 5 most recent previous secrets
-                session.previous_secrets.remove(0);
+            // If we had an original key, store it properly
+            if let Some(original_key) = original_key_opt {
+                session.previous_secrets.push(original_key);
+                if session.previous_secrets.len() > 5 {
+                    // Keep only the 5 most recent previous secrets
+                    session.previous_secrets.remove(0);
+                }
             }
             
             // Make a copy of the shared key for logging
