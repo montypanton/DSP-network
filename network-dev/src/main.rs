@@ -135,7 +135,7 @@ fn start_messenger(broker: &str, port: u16, display_name: &str) -> Result<(), Bo
     // Configure key rotation - every 50 messages or 300 seconds (5 minutes)
     {
         let crypto_context_mut = Arc::get_mut(&mut crypto_context).unwrap();
-        crypto_context_mut.configure_rotation(50, 300);
+        crypto_context_mut.configure_rotation(50, 3600); 
     }
     
     let device_id = crypto_context.device_id.clone();

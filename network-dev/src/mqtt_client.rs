@@ -403,10 +403,11 @@ impl MqttMessenger {
         // Drop the lock before proceeding
         drop(devices);
         
-        // Generate our ephemeral keypair
+        println!("Initializing secure session with {}", recipient_id);
+        
+        // Generate our ephemeral keypair for forward secrecy
         let (ephemeral_secret, ephemeral_public) = self.crypto.generate_ephemeral_keypair();
-        println!("Generated ephemeral key for session with {}: {}", 
-                 recipient_id, hex::encode(ephemeral_public.as_bytes()));
+        println!("Generated new ephemeral key for session with {}", recipient_id);
         
         // Store our ephemeral secret for this recipient
         self.crypto.store_ephemeral_secret(recipient_id, ephemeral_secret);
@@ -439,14 +440,14 @@ impl MqttMessenger {
         
         // Wait for the message to be delivered
         drop(client);
-        thread::sleep(Duration::from_millis(300));
+        thread::sleep(Duration::from_millis(500)); // Increased delay for reliability
         
         // If we already have the recipient's ephemeral key, create the session
         if let Some(their_ephemeral_key) = recipient.ephemeral_key {
             if let Ok(key_bytes) = BASE64.decode(&their_ephemeral_key) {
-                self.crypto.create_session_from_stored_secret(recipient_id, &key_bytes)?;
+                self.crypto.create_or_update_session(recipient_id, &key_bytes)?;
                 println!("Created session with existing ephemeral key from {}", recipient_id);
-                thread::sleep(Duration::from_millis(100));
+                thread::sleep(Duration::from_millis(200)); // Extra time for key derivation
             }
         }
         
@@ -462,11 +463,10 @@ impl MqttMessenger {
             timestamp: Utc::now().timestamp() as u64,
         };
         
-        let text_msg_json = serde_json::to_string(&text_msg).map_err(|e| format!("JSON error: {}", e))?;
+        let text_msg_json = serde_json::to_string(&text_msg)?;
         
         let (encrypted_data, nonce, ephemeral_public, topic, is_initial_kyber) = if let Some(recipient) = &recipient_id {
-            // FIX: Don't re-establish session here - we'll assume initialize_session was called first
-            // Personal message - try to use forward secrecy if available
+            // Check if we have an established session
             let has_session = {
                 let sessions = self.crypto.session_keys.lock().unwrap();
                 sessions.contains_key(recipient)
@@ -476,33 +476,38 @@ impl MqttMessenger {
                 // Session not established - initialize it first
                 self.initialize_session(recipient)?;
                 
-                // IMPORTANT FIX: Allow time for the session to be established
-                thread::sleep(Duration::from_millis(300));
+                // Give time for the session to be fully established
+                thread::sleep(Duration::from_millis(500));
             }
             
             // Try to use session keys first for forward secrecy (AES-256)
             let encryption_result = self.crypto.encrypt_with_session(recipient, text_msg_json.as_bytes());
             
             match encryption_result {
-                Ok((enc, eph)) => {
+                Ok((enc, should_rotate)) => {
                     // Successfully encrypted with session keys
-                    println!("\rUsing AES-256 with forward secrecy session for encryption");
+                    println!("Using AES-256 with forward secrecy session for encryption");
                     
-                    // No need to extract nonce - it's already included in the encrypted package
-                    let eph_key = eph.map(|k| BASE64.encode(k.as_bytes()));
+                    // If key rotation is needed, generate a new ephemeral key
+                    let eph_key = if should_rotate {
+                        println!("Key rotation triggered - sending new ephemeral key");
+                        let (new_secret, new_public) = self.crypto.generate_ephemeral_keypair();
+                        self.crypto.store_ephemeral_secret(recipient, new_secret);
+                        Some(BASE64.encode(new_public.as_bytes()))
+                    } else {
+                        None
+                    };
                     
                     (BASE64.encode(&enc), 
-                     "".to_string(), // We don't need a separate nonce for session-based encryption
+                     "".to_string(), // No separate nonce for session-based encryption
                      eph_key, 
                      format!("secure-msg/device/{}", recipient), 
                      false)
                 },
                 Err(e) => {
-                    println!("\rSession encryption failed: {}, falling back to Kyber", e);
-                    print!("\r> ");
-                    io::stdout().flush().ok();
+                    // Fall back to Kyber encryption if session fails
+                    println!("Session encryption failed: {}, falling back to Kyber", e);
                     
-                    // Fall back to Kyber encryption
                     let recipient_info = {
                         let devices = self.known_devices.lock().unwrap();
                         let device = devices.iter().find(|d| d.device_id == *recipient);
@@ -527,15 +532,11 @@ impl MqttMessenger {
             }
         } else {
             // Broadcast message - use Kyber with our own public key
-            println!("\rPreparing broadcast message using Kyber");
-            print!("\r> ");
-            io::stdout().flush().ok();
-            
             // Get encoded version of our Kyber public key
             let kyber_pk_bytes = self.crypto.kyber_public_key.as_bytes();
             let encoded_pk = BASE64.encode(kyber_pk_bytes);
             
-            // Use our own public key just to create a valid encryption (this is a simplification)
+            // Use Kyber for broadcast messages
             let (ciphertext, nonce_bytes) = self.crypto.encrypt_message(&encoded_pk, text_msg_json.as_bytes())?;
             
             (BASE64.encode(&ciphertext), 
@@ -557,7 +558,7 @@ impl MqttMessenger {
             is_initial_kyber,
         };
         
-        let message_json = serde_json::to_string(&message).map_err(|e| format!("JSON error: {}", e))?;
+        let message_json = serde_json::to_string(&message)?;
         
         // Send the message
         let mut client = self.client.lock().unwrap();
@@ -566,7 +567,7 @@ impl MqttMessenger {
             QoS::AtLeastOnce,
             false,
             message_json.as_bytes(),
-        ).map_err(|e| format!("Publish error: {:?}", e))?;
+        )?;
         
         Ok(())
     }
