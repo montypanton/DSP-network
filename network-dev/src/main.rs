@@ -243,14 +243,19 @@ fn start_messenger(broker: &str, port: u16, display_name: &str) -> Result<(), Bo
                 let recipient_id = parts[1];
                 let message = parts[2];
                 
-                // First try to establish a secure session
-                {
+                // First establish a secure session (and allow sufficient time for it)
+                let session_result = {
                     let mut messenger = messenger_arc.lock().unwrap();
-                    let _ = messenger.initialize_session(recipient_id);
+                    messenger.initialize_session(recipient_id)
+                };
+                
+                if let Err(e) = session_result {
+                    println!("Failed to establish secure session: {}", e.to_string().red());
+                    continue;
                 }
                 
-                // Small delay to allow session setup
-                thread::sleep(Duration::from_millis(100));
+                // Allow time for key exchange to settle
+                thread::sleep(Duration::from_millis(500));  // IMPORTANT FIX: Increased delay
                 
                 // Then send the message
                 let result = {

@@ -5,7 +5,7 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use rand::{rngs::OsRng, RngCore};
-use x25519_dalek::{EphemeralSecret, PublicKey as X25519Public};
+use x25519_dalek::{EphemeralSecret, PublicKey as X25519Public, StaticSecret};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -20,11 +20,16 @@ pub struct CryptoContext {
     pub kyber_secret_key: SecretKey,
     pub kyber_public_key: PublicKey,
     pub session_keys: Arc<Mutex<HashMap<String, SessionKeys>>>,
-    // Key rotation tracking
+    
+    // For key rotation
     pub messages_since_rotation: Arc<Mutex<HashMap<String, usize>>>,
-    pub rotation_interval: usize, // Number of messages before key rotation
-    pub last_rotation_time: Arc<Mutex<HashMap<String, u64>>>, // Timestamp of last rotation
-    pub time_rotation_interval: u64, // Seconds between time-based rotations
+    pub rotation_interval: usize,
+    pub last_rotation_time: Arc<Mutex<HashMap<String, u64>>>,
+    pub time_rotation_interval: u64,
+    
+    // X25519 static keypair for consistent sessions
+    pub x25519_static_secret: StaticSecret,
+    pub x25519_static_public: X25519Public,
 }
 
 impl CryptoContext {
@@ -37,19 +42,25 @@ impl CryptoContext {
         OsRng.fill_bytes(&mut device_id_bytes);
         let device_id = hex::encode(device_id_bytes);
         
+        // Generate static X25519 keypair
+        let x25519_static_secret = StaticSecret::new(OsRng);
+        let x25519_static_public = X25519Public::from(&x25519_static_secret);
+        
         Self {
             device_id,
             kyber_secret_key,
             kyber_public_key,
             session_keys: Arc::new(Mutex::new(HashMap::new())),
             messages_since_rotation: Arc::new(Mutex::new(HashMap::new())),
-            rotation_interval: 50, // Rotate keys every 50 messages by default
+            rotation_interval: 50,
             last_rotation_time: Arc::new(Mutex::new(HashMap::new())),
-            time_rotation_interval: 300, // Rotate keys every 5 minutes by default
+            time_rotation_interval: 300,
+            x25519_static_secret,
+            x25519_static_public,
         }
     }
     
-    // Method to configure key rotation settings
+    // Configure key rotation
     pub fn configure_rotation(&mut self, message_interval: usize, time_interval_secs: u64) {
         self.rotation_interval = message_interval;
         self.time_rotation_interval = time_interval_secs;
@@ -57,63 +68,140 @@ impl CryptoContext {
                  message_interval, time_interval_secs);
     }
     
-    // Create a device info object for sharing
+    // Create device info for sharing
     pub fn get_device_info(&self, display_name: &str) -> DeviceInfo {
-        // Generate an ephemeral key for this device to enable session establishment
-        let (_, ephemeral_public) = self.generate_ephemeral_keypair();
-        
         DeviceInfo {
             device_id: self.device_id.clone(),
             public_key: BASE64.encode(self.kyber_public_key.as_bytes()),
             display_name: display_name.to_string(),
-            ephemeral_key: Some(BASE64.encode(ephemeral_public.as_bytes())),
+            // Share static X25519 public key instead of ephemeral
+            ephemeral_key: Some(BASE64.encode(self.x25519_static_public.as_bytes())),
         }
     }
     
-    // Generate a new X25519 ephemeral keypair
+    // Create or update a session with another device
+    pub fn create_or_update_session(&self, peer_id: &str, peer_x25519_key: &[u8]) -> Result<(), String> {
+        println!("Setting up X25519 session with {}", peer_id);
+        
+        // Validate peer key
+        if peer_x25519_key.len() != 32 {
+            return Err(format!("Invalid X25519 public key size: {} bytes, expected 32", peer_x25519_key.len()));
+        }
+        
+        // Convert bytes to X25519 public key
+        let peer_public = match X25519Public::from_bytes(peer_x25519_key) {
+            Ok(key) => key,
+            Err(_) => return Err("Invalid X25519 public key format".to_string()),
+        };
+        
+        // Use our static secret to derive shared secret with peer
+        let shared_secret = self.x25519_static_secret.diffie_hellman(&peer_public);
+        
+        // Derive a deterministic session key from the shared secret
+        let session_key = self.derive_deterministic_key(peer_id, &shared_secret.to_bytes());
+        
+        // Store or update the session
+        let mut sessions = self.session_keys.lock().unwrap();
+        
+        if let Some(session) = sessions.get_mut(peer_id) {
+            // Store previous key for backward compatibility
+            session.previous_secrets.push(session.shared_secret.clone());
+            if session.previous_secrets.len() > 5 {
+                session.previous_secrets.remove(0);
+            }
+            
+            // Debug output
+            let key_prefix = hex::encode(&session_key[0..4]);
+            
+            // Update with new key
+            session.shared_secret = session_key;
+            println!("Updated existing session with {} (shared key prefix: {})", peer_id, key_prefix);
+        } else {
+            // Debug output
+            let key_prefix = hex::encode(&session_key[0..4]);
+            
+            // Create new session
+            sessions.insert(peer_id.to_string(), SessionKeys {
+                recipient_id: peer_id.to_string(),
+                shared_secret: session_key,
+                previous_secrets: Vec::new(),
+            });
+            println!("Created new session with {} (shared key prefix: {})", peer_id, key_prefix);
+        }
+        
+        // Reset rotation tracking
+        drop(sessions);
+        {
+            let mut counters = self.messages_since_rotation.lock().unwrap();
+            counters.insert(peer_id.to_string(), 0);
+        }
+        
+        {
+            let mut times = self.last_rotation_time.lock().unwrap();
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            times.insert(peer_id.to_string(), now);
+        }
+        
+        Ok(())
+    }
+    
+    // Derive a deterministic key using peer ID and shared secret
+    fn derive_deterministic_key(&self, peer_id: &str, shared_secret: &[u8]) -> Vec<u8> {
+        // Arrange IDs in deterministic order for consistent key derivation
+        let (first_id, second_id) = if self.device_id < peer_id.to_string() {
+            (self.device_id.as_str(), peer_id)
+        } else {
+            (peer_id, self.device_id.as_str())
+        };
+        
+        // Create context for key derivation
+        let mut context = Vec::with_capacity(64);
+        context.extend_from_slice(b"SECURE-MSG-KEY-");
+        context.extend_from_slice(first_id.as_bytes());
+        context.extend_from_slice(b"-");
+        context.extend_from_slice(second_id.as_bytes());
+        
+        // Use SHA-256 for key derivation
+        let mut kdf = Context::new(&SHA256);
+        kdf.update(&context);
+        kdf.update(shared_secret);
+        let digest = kdf.finish();
+        
+        let key = digest.as_ref().to_vec();
+        println!("Derived key (prefix): {}", hex::encode(&key[0..4]));
+        
+        key
+    }
+    
+    // Generate a random ephemeral keypair for temporary use
     pub fn generate_ephemeral_keypair(&self) -> (EphemeralSecret, X25519Public) {
         let secret = EphemeralSecret::random_from_rng(OsRng);
         let public = X25519Public::from(&secret);
         (secret, public)
     }
     
-    // Initial key exchange using Kyber for PQC security
-    pub fn encrypt_message(&self, recipient_public_key_b64: &str, message: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
-        // Decode the recipient's public key
-        let recipient_public_key_bytes = BASE64.decode(recipient_public_key_b64)
-            .map_err(|_| "Invalid public key encoding".to_string())?;
+    // Encrypt using session key
+    pub fn encrypt_with_session(&self, recipient_id: &str, message: &[u8]) -> Result<(Vec<u8>, bool), String> {
+        // Check if we need to rotate keys
+        let should_rotate = self.should_rotate_key(recipient_id)?;
         
-        // Make sure we have the correct key size for Kyber768
-        let expected_size = kyber768::public_key_bytes();
-        if recipient_public_key_bytes.len() != expected_size {
-            return Err(format!("Invalid public key size: {} bytes, expected {} bytes for Kyber768", 
-                             recipient_public_key_bytes.len(), 
-                             expected_size));
-        }
-        
-        // Create the PublicKey directly from bytes
-        let recipient_public_key = match PublicKey::from_bytes(&recipient_public_key_bytes) {
-            Ok(pk) => pk,
-            Err(_) => return Err("Invalid public key format".to_string()),
+        // Get the current session key
+        let shared_secret = {
+            let sessions = self.session_keys.lock().unwrap();
+            if let Some(session) = sessions.get(recipient_id) {
+                session.shared_secret.clone()
+            } else {
+                return Err(format!("No session established with {}", recipient_id));
+            }
         };
         
-        // Perform Kyber key encapsulation
-        let (ciphertext, shared_secret) = kyber768::encapsulate(&recipient_public_key);
-        
-        // Use the shared secret to create an AES-256 key
-        // We use SHA-256 to derive a proper 32-byte key from the shared secret
-        let mut context = Context::new(&SHA256);
-        context.update(shared_secret.as_bytes());
-        let digest = context.finish();
-        let key_bytes = digest.as_ref();
-        
         // Create AES-GCM cipher
-        let cipher = match Aes256Gcm::new_from_slice(key_bytes) {
+        let cipher = match Aes256Gcm::new_from_slice(&shared_secret[0..32]) {
             Ok(c) => c,
             Err(_) => return Err("Failed to create AES-256-GCM cipher".to_string()),
         };
         
-        // Generate a random nonce (12 bytes for AES-GCM)
+        // Generate random nonce
         let mut nonce_bytes = [0u8; 12];
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
@@ -124,268 +212,66 @@ impl CryptoContext {
             Err(e) => return Err(format!("Encryption failed: {}", e)),
         };
         
-        // Create the combined output
-        let mut result = Vec::new();
-        result.extend_from_slice(ciphertext.as_bytes());
-        result.extend_from_slice(&encrypted_data);
-        
-        Ok((result, nonce_bytes.to_vec()))
-    }
-    
-    // Decrypt a message using Kyber and AES-256-GCM
-    pub fn decrypt_message(&self, ciphertext: &[u8], nonce: &[u8], encrypted_data: &[u8]) -> Result<Vec<u8>, String> {
-        // Convert the ciphertext bytes to a Kyber ciphertext
-        let kyber_ciphertext = match kyber768::Ciphertext::from_bytes(ciphertext) {
-            Ok(ct) => ct,
-            Err(_) => return Err("Invalid ciphertext format".to_string()),
-        };
-        
-        if nonce.len() != 12 {
-            return Err(format!("Invalid nonce size: {} bytes, expected 12", nonce.len()));
-        }
-        
-        // Decapsulate the shared secret
-        let shared_secret = kyber768::decapsulate(&kyber_ciphertext, &self.kyber_secret_key);
-        
-        // Derive AES key from shared secret
-        let mut context = Context::new(&SHA256);
-        context.update(shared_secret.as_bytes());
-        let digest = context.finish();
-        let key_bytes = digest.as_ref();
-        
-        // Create the AES cipher
-        let cipher = match Aes256Gcm::new_from_slice(key_bytes) {
-            Ok(c) => c,
-            Err(_) => return Err("Failed to create AES-256-GCM cipher".to_string()),
-        };
-        
-        // Decrypt the message
-        let nonce = Nonce::from_slice(nonce);
-        match cipher.decrypt(nonce, encrypted_data) {
-            Ok(plaintext) => Ok(plaintext),
-            Err(e) => Err(format!("Decryption failed: {}", e)),
-        }
-    }
-    
-    // Create a forward secrecy session using X25519
-    pub fn create_forward_secrecy_session(&self, recipient_id: &str, recipient_ephemeral_key: &[u8]) -> Result<X25519Public, String> {
-        // Debug output to track key creation
-        println!("Creating forward secrecy session with {}", recipient_id);
-        
-        // Validate input size
-        if recipient_ephemeral_key.len() != 32 {
-            return Err(format!("Invalid ephemeral key size: {} bytes, expected 32", recipient_ephemeral_key.len()));
-        }
-        
-        // Generate a new ephemeral keypair
-        let (ephemeral_secret, ephemeral_public) = self.generate_ephemeral_keypair();
-        
-        // Print debug info
-        println!("My ephemeral public key: {}", hex::encode(ephemeral_public.as_bytes()));
-        println!("Recipient ephemeral public key: {}", hex::encode(recipient_ephemeral_key));
-        
-        // Use symmetrical key derivation for consistency between peers
-        let shared_key = self.derive_symmetrical_key(
-            recipient_id,
-            ephemeral_public.as_bytes(),
-            recipient_ephemeral_key
-        );
-        
-        // Store or update the session
-        let mut sessions = self.session_keys.lock().unwrap();
-        
-        if let Some(session) = sessions.get_mut(recipient_id) {
-            // Store previous secret for possible out-of-order messages
-            session.previous_secrets.push(session.shared_secret.clone());
-            if session.previous_secrets.len() > 5 {
-                // Keep only the 5 most recent previous secrets
-                session.previous_secrets.remove(0);
-            }
-            
-            // Make a copy of the shared key prefix for logging
-            let shared_key_prefix = hex::encode(&shared_key[0..4]);
-            
-            // Update with new secret
-            session.shared_secret = shared_key;
-            println!("Updated existing session with {} (shared secret prefix: {})", 
-                    recipient_id, shared_key_prefix);
-        } else {
-            // Make a copy of the shared key prefix for logging
-            let shared_key_prefix = hex::encode(&shared_key[0..4]);
-            
-            // Create new session
-            sessions.insert(recipient_id.to_string(), SessionKeys {
-                recipient_id: recipient_id.to_string(),
-                shared_secret: shared_key,
-                previous_secrets: Vec::new(),
-            });
-            println!("Created new session with {} (shared secret prefix: {})", 
-                    recipient_id, shared_key_prefix);
-        }
-        
-        // Reset rotation counters
-        drop(sessions);
-        {
-            let mut counters = self.messages_since_rotation.lock().unwrap();
-            counters.insert(recipient_id.to_string(), 0);
-        }
-        
-        {
-            let mut times = self.last_rotation_time.lock().unwrap();
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-            times.insert(recipient_id.to_string(), now);
-        }
-        
-        Ok(ephemeral_public)
-    }
-    
-    // Check if key rotation is needed and perform if necessary
-    pub fn check_key_rotation(&self, recipient_id: &str) -> Result<Option<X25519Public>, String> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        
-        let should_rotate_by_count;
-        let should_rotate_by_time;
-        
-        // Check message count-based rotation
-        {
-            let mut counts = self.messages_since_rotation.lock().unwrap();
-            let count = counts.entry(recipient_id.to_string()).or_insert(0);
-            *count += 1;
-            should_rotate_by_count = *count >= self.rotation_interval;
-            
-            if should_rotate_by_count {
-                println!("Key rotation triggered by message count: {}/{}", 
-                        *count, self.rotation_interval);
-                *count = 0; // Reset counter if we're going to rotate
-            }
-        }
-        
-        // Check time-based rotation
-        {
-            let mut last_times = self.last_rotation_time.lock().unwrap();
-            let last_time = last_times.entry(recipient_id.to_string()).or_insert(now);
-            should_rotate_by_time = now - *last_time >= self.time_rotation_interval;
-            
-            if should_rotate_by_time {
-                println!("Key rotation triggered by time: {} seconds since last rotation", 
-                        now - *last_time);
-                *last_time = now; // Update last rotation time
-            }
-        }
-        
-        // If either condition is met, rotate keys
-        if should_rotate_by_count || should_rotate_by_time {
-            // First check if we have an active session
-            let has_session = {
-                let sessions = self.session_keys.lock().unwrap();
-                sessions.contains_key(recipient_id)
-            };
-            
-            if has_session {
-                return self.rotate_keys(recipient_id);
-            }
-        }
-        
-        Ok(None)
-    }
-    
-    // Rotate keys for a session
-    pub fn rotate_keys(&self, recipient_id: &str) -> Result<Option<X25519Public>, String> {
-        // We'll need an active session to rotate
-        let has_session = {
-            let sessions = self.session_keys.lock().unwrap();
-            sessions.contains_key(recipient_id)
-        };
-        
-        if !has_session {
-            return Err(format!("No active session with {}", recipient_id));
-        }
-        
-        // Generate a new ephemeral keypair 
-        let (_ephemeral_secret, ephemeral_public) = self.generate_ephemeral_keypair();
-        
-        // Update the session counter
-        {
-            let mut counters = self.messages_since_rotation.lock().unwrap();
-            counters.insert(recipient_id.to_string(), 0);
-        }
-        
-        // Update rotation time
-        {
-            let mut times = self.last_rotation_time.lock().unwrap();
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-            times.insert(recipient_id.to_string(), now);
-        }
-        
-        println!("Generated new key for rotation with {}", recipient_id);
-        
-        // Return the public key to be sent
-        Ok(Some(ephemeral_public))
-    }
-    
-    // Encrypt a message using the forward secrecy session with AES-256
-    pub fn encrypt_with_session(&self, recipient_id: &str, message: &[u8]) -> Result<(Vec<u8>, Option<X25519Public>), String> {
-        // Only include ephemeral key if we need to rotate
-        let mut should_include_ephemeral = false;
-        let shared_secret;
-        
-        // Get the current session key
-        {
-            let sessions = self.session_keys.lock().unwrap();
-            if let Some(session) = sessions.get(recipient_id) {
-                shared_secret = session.shared_secret.clone();
-            } else {
-                return Err(format!("No session established with {}", recipient_id));
-            }
-        }
-        
-        // Use the shared secret to create an AES-256 key
-        // The shared secret from X25519 is already 32 bytes (256 bits)
-        let cipher = match Aes256Gcm::new_from_slice(&shared_secret[0..32]) {
-            Ok(c) => c,
-            Err(_) => return Err("Failed to create AES-256-GCM cipher".to_string()),
-        };
-        
-        // Generate a random nonce
-        let mut nonce_bytes = [0u8; 12]; // AES-GCM requires a 12-byte nonce
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        
-        // Encrypt the message
-        let encrypted_data = match cipher.encrypt(nonce, message) {
-            Ok(ciphertext) => ciphertext,
-            Err(e) => return Err(format!("Encryption failed: {}", e)),
-        };
-        
-        // Check if we need to rotate keys and get new ephemeral public if so
-        let new_ephemeral = match self.check_key_rotation(recipient_id) {
-            Ok(Some(ephemeral)) => {
-                should_include_ephemeral = true;
-                Some(ephemeral)
-            },
-            Ok(None) => None,
-            Err(e) => {
-                println!("Warning: Key rotation check failed: {}", e);
-                None
-            }
-        };
-        
-        if should_include_ephemeral {
-            println!("Including ephemeral key with message for key rotation");
-        }
-        
         // Combine nonce and encrypted data
         let mut result = Vec::new();
         result.extend_from_slice(&nonce_bytes);
         result.extend_from_slice(&encrypted_data);
         
-        Ok((result, new_ephemeral))
+        if should_rotate {
+            // Mark rotation in message count
+            let mut counters = self.messages_since_rotation.lock().unwrap();
+            *counters.entry(recipient_id.to_string()).or_insert(0) = 0;
+            
+            // Update rotation time
+            let mut times = self.last_rotation_time.lock().unwrap();
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            times.insert(recipient_id.to_string(), now);
+            
+            println!("Key rotation requested with message");
+        }
+        
+        Ok((result, should_rotate))
     }
     
-    // Decrypt a message using the forward secrecy session
+    // Check if key rotation is needed
+    fn should_rotate_key(&self, recipient_id: &str) -> Result<bool, String> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        let rotate_by_count;
+        let rotate_by_time;
+        
+        // Check message count
+        {
+            let mut counts = self.messages_since_rotation.lock().unwrap();
+            let count = counts.entry(recipient_id.to_string()).or_insert(0);
+            *count += 1;
+            rotate_by_count = *count >= self.rotation_interval;
+            
+            if rotate_by_count {
+                println!("Key rotation triggered by message count: {}/{}", 
+                        *count, self.rotation_interval);
+            }
+        }
+        
+        // Check time
+        {
+            let times = self.last_rotation_time.lock().unwrap();
+            let last_time = times.get(recipient_id).unwrap_or(&now);
+            rotate_by_time = now - *last_time >= self.time_rotation_interval;
+            
+            if rotate_by_time {
+                println!("Key rotation triggered by time: {} seconds since last rotation", 
+                        now - *last_time);
+            }
+        }
+        
+        Ok(rotate_by_count || rotate_by_time)
+    }
+    
+    // Decrypt using session key
     pub fn decrypt_with_session(&self, sender_id: &str, encrypted_package: &[u8]) -> Result<Vec<u8>, String> {
         if encrypted_package.len() < 12 {
             return Err(format!("Invalid encrypted package: {} bytes, expected at least 12", encrypted_package.len()));
@@ -424,7 +310,7 @@ impl CryptoContext {
                                 
                         let prev_cipher = match Aes256Gcm::new_from_slice(&prev_secret[0..32]) {
                             Ok(c) => c,
-                            Err(_) => continue, // Skip this key if we can't create a cipher
+                            Err(_) => continue,
                         };
                         
                         if let Ok(plaintext) = prev_cipher.decrypt(nonce, ciphertext) {
@@ -449,121 +335,92 @@ impl CryptoContext {
             return Err(format!("No session established with {}", sender_id));
         }
     }
-
-    pub fn derive_symmetrical_key(&self, peer_id: &str, our_ephemeral_key: &[u8], their_ephemeral_key: &[u8]) -> Vec<u8> {
-        // Create a deterministic derivation that will be identical on both sides
-        let mut combined = Vec::with_capacity(64 + self.device_id.len() + peer_id.len());
+    
+    // Kyber-based encryption for initial or fallback
+    pub fn encrypt_message(&self, recipient_public_key_b64: &str, message: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+        // Decode the recipient's public key
+        let recipient_public_key_bytes = BASE64.decode(recipient_public_key_b64)
+            .map_err(|_| "Invalid public key encoding".to_string())?;
         
-        // Sort device IDs lexicographically for consistency
-        let (first_id, second_id) = if self.device_id < peer_id.to_string() {
-            (self.device_id.as_str(), peer_id)
-        } else {
-            (peer_id, self.device_id.as_str())
+        // Validate key size
+        let expected_size = kyber768::public_key_bytes();
+        if recipient_public_key_bytes.len() != expected_size {
+            return Err(format!("Invalid public key size: {} bytes, expected {} bytes for Kyber768", 
+                             recipient_public_key_bytes.len(), expected_size));
+        }
+        
+        // Create PublicKey from bytes
+        let recipient_public_key = match PublicKey::from_bytes(&recipient_public_key_bytes) {
+            Ok(pk) => pk,
+            Err(_) => return Err("Invalid public key format".to_string()),
         };
         
-        // Sort public keys for consistency
-        let our_key_hex = hex::encode(our_ephemeral_key);
-        let their_key_hex = hex::encode(their_ephemeral_key);
+        // Perform Kyber key encapsulation
+        let (ciphertext, shared_secret) = kyber768::encapsulate(&recipient_public_key);
         
-        let (first_key, second_key) = if our_key_hex < their_key_hex {
-            (our_ephemeral_key, their_ephemeral_key)
-        } else {
-            (their_ephemeral_key, our_ephemeral_key)
-        };
-        
-        // Combine everything in a deterministic order
-        combined.extend_from_slice(first_id.as_bytes());
-        combined.extend_from_slice(second_id.as_bytes());
-        combined.extend_from_slice(first_key);
-        combined.extend_from_slice(second_key);
-        
-        // Use a hash as a key derivation function for AES-256
+        // Derive AES key from shared secret
         let mut context = Context::new(&SHA256);
-        context.update(&combined);
+        context.update(shared_secret.as_bytes());
         let digest = context.finish();
+        let key_bytes = digest.as_ref();
         
-        let key = digest.as_ref().to_vec();
-        println!("Derived symmetrical key (prefix): {}", hex::encode(&key[0..4]));
+        // Create AES-GCM cipher
+        let cipher = match Aes256Gcm::new_from_slice(key_bytes) {
+            Ok(c) => c,
+            Err(_) => return Err("Failed to create AES-256-GCM cipher".to_string()),
+        };
         
-        key
+        // Generate random nonce
+        let mut nonce_bytes = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        
+        // Encrypt the message
+        let encrypted_data = match cipher.encrypt(nonce, message) {
+            Ok(ciphertext) => ciphertext,
+            Err(e) => return Err(format!("Encryption failed: {}", e)),
+        };
+        
+        // Create the combined output
+        let mut result = Vec::new();
+        result.extend_from_slice(ciphertext.as_bytes());
+        result.extend_from_slice(&encrypted_data);
+        
+        Ok((result, nonce_bytes.to_vec()))
     }
     
-    pub fn handle_ephemeral_key(&self, sender_id: &str, their_ephemeral_key: &[u8]) -> Result<(), String> {
-        println!("Handling ephemeral key from {}", sender_id);
-        println!("Received ephemeral key: {}", hex::encode(their_ephemeral_key));
-        
-        if their_ephemeral_key.len() != 32 {
-            return Err(format!("Invalid ephemeral key length: {}, expected 32", their_ephemeral_key.len()));
-        }
-        
-        // Generate our ephemeral keys
-        let (_ephemeral_secret, our_public) = self.generate_ephemeral_keypair();
-        println!("Our ephemeral public key: {}", hex::encode(our_public.as_bytes()));
-        
-        // Derive a symmetrical key that will be the same on both sides
-        let shared_key = self.derive_symmetrical_key(
-            sender_id,
-            our_public.as_bytes(),
-            their_ephemeral_key
-        );
-        
-        // First save the original session key if it exists
-        let original_key_opt = {
-            let sessions = self.session_keys.lock().unwrap();
-            if let Some(session) = sessions.get(sender_id) {
-                Some(session.shared_secret.clone())
-            } else {
-                None
-            }
+    // Kyber-based decryption
+    pub fn decrypt_message(&self, ciphertext: &[u8], nonce: &[u8], encrypted_data: &[u8]) -> Result<Vec<u8>, String> {
+        // Convert to Kyber ciphertext
+        let kyber_ciphertext = match kyber768::Ciphertext::from_bytes(ciphertext) {
+            Ok(ct) => ct,
+            Err(_) => return Err("Invalid ciphertext format".to_string()),
         };
         
-        // Store the shared key in our session manager
-        let mut sessions = self.session_keys.lock().unwrap();
-        
-        if let Some(session) = sessions.get_mut(sender_id) {
-            // If we had an original key, store it properly
-            if let Some(original_key) = original_key_opt {
-                session.previous_secrets.push(original_key);
-                if session.previous_secrets.len() > 5 {
-                    // Keep only the 5 most recent previous secrets
-                    session.previous_secrets.remove(0);
-                }
-            }
-            
-            // Make a copy of the shared key for logging
-            let shared_key_prefix = hex::encode(&shared_key[0..4]);
-            
-            // Update with new secret
-            session.shared_secret = shared_key;
-            println!("Updated existing session with {} (shared secret prefix: {})", 
-                    sender_id, shared_key_prefix);
-        } else {
-            // Make a copy of the shared key for logging
-            let shared_key_prefix = hex::encode(&shared_key[0..4]);
-            
-            // Create new session
-            sessions.insert(sender_id.to_string(), SessionKeys {
-                recipient_id: sender_id.to_string(),
-                shared_secret: shared_key,
-                previous_secrets: Vec::new(),
-            });
-            println!("Created new session with {} (shared secret prefix: {})", 
-                    sender_id, shared_key_prefix);
+        if nonce.len() != 12 {
+            return Err(format!("Invalid nonce size: {} bytes, expected 12", nonce.len()));
         }
         
-        // Reset rotation counters
-        drop(sessions);
-        {
-            let mut counters = self.messages_since_rotation.lock().unwrap();
-            counters.insert(sender_id.to_string(), 0);
-        }
+        // Decapsulate shared secret
+        let shared_secret = kyber768::decapsulate(&kyber_ciphertext, &self.kyber_secret_key);
         
-        {
-            let mut times = self.last_rotation_time.lock().unwrap();
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-            times.insert(sender_id.to_string(), now);
-        }
+        // Derive AES key
+        let mut context = Context::new(&SHA256);
+        context.update(shared_secret.as_bytes());
+        let digest = context.finish();
+        let key_bytes = digest.as_ref();
         
-        Ok(())
+        // Create AES cipher
+        let cipher = match Aes256Gcm::new_from_slice(key_bytes) {
+            Ok(c) => c,
+            Err(_) => return Err("Failed to create AES-256-GCM cipher".to_string()),
+        };
+        
+        // Decrypt
+        let nonce = Nonce::from_slice(nonce);
+        match cipher.decrypt(nonce, encrypted_data) {
+            Ok(plaintext) => Ok(plaintext),
+            Err(e) => Err(format!("Decryption failed: {}", e)),
+        }
     }
 }

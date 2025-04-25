@@ -237,7 +237,6 @@ impl MqttMessenger {
             },
             MessageType::KeyExchange => {
                 // Process key exchange message FIRST - this is specifically for forward secrecy
-                // This is critical to do before TextMessage processing to ensure session is established
                 if let Some(ephemeral_key) = &enc_message.ephemeral_public {
                     if let Ok(key_bytes) = BASE64.decode(ephemeral_key) {
                         match crypto.handle_ephemeral_key(&enc_message.sender_id, &key_bytes) {
@@ -256,28 +255,25 @@ impl MqttMessenger {
                 }
             },
             MessageType::TextMessage => {
-                // Process text message with improved decryption logic
-                if let Ok(ct_bytes) = BASE64.decode(&enc_message.encrypted_data) {
-                    // CRITICAL FIX: Handle ephemeral key first, if present,
-                    // to update session BEFORE trying to decrypt
-                    let mut used_ephemeral = false;
-                    if let Some(ephemeral_key) = &enc_message.ephemeral_public {
-                        if let Ok(key_bytes) = BASE64.decode(ephemeral_key) {
-                            // Process the ephemeral key first to update our session
-                            match crypto.handle_ephemeral_key(&enc_message.sender_id, &key_bytes) {
-                                Ok(_) => {
-                                    println!("\rUpdated session with ephemeral key from {}", enc_message.sender_id);
-                                    used_ephemeral = true; // Mark that we used a new ephemeral key
-                                    // Give time for the key exchange to complete
-                                    thread::sleep(Duration::from_millis(10));
-                                },
-                                Err(e) => {
-                                    println!("\rWarning: Failed to handle ephemeral key: {}", e);
-                                }
+                // CRITICAL FIX: Handle ephemeral key first, if present, to update session BEFORE decryption
+                if let Some(ephemeral_key) = &enc_message.ephemeral_public {
+                    if let Ok(key_bytes) = BASE64.decode(ephemeral_key) {
+                        // Process the ephemeral key first to update our session
+                        match crypto.handle_ephemeral_key(&enc_message.sender_id, &key_bytes) {
+                            Ok(_) => {
+                                println!("\rUpdated session with ephemeral key from {}", enc_message.sender_id);
+                                // Give time for the key exchange to complete
+                                thread::sleep(Duration::from_millis(100));
+                            },
+                            Err(e) => {
+                                println!("\rWarning: Failed to handle ephemeral key: {}", e);
                             }
                         }
                     }
-                    
+                }
+                
+                // Now process the text message
+                if let Ok(ct_bytes) = BASE64.decode(&enc_message.encrypted_data) {
                     // Now handle the decryption based on message type
                     let decryption_result = if enc_message.is_initial_kyber {
                         // Initial Kyber-based encryption/decryption
@@ -293,7 +289,7 @@ impl MqttMessenger {
                             Err("Invalid nonce encoding".to_string())
                         }
                     } else {
-                        // Session-based encryption (AES-GCM) with or without new ephemeral key
+                        // Session-based encryption (AES-GCM)
                         crypto.decrypt_with_session(&enc_message.sender_id, &ct_bytes)
                     };
                     
@@ -305,9 +301,6 @@ impl MqttMessenger {
                                         // Clear the current line before displaying the message
                                         print!("\r\x1B[K"); // Clear the current line
                                         cb(text_msg.from_name, text_msg.content);
-                                        // Restore the prompt after the message callback
-                                        print!("\r> ");
-                                        io::stdout().flush().ok();
                                     }
                                 },
                                 Err(e) => {
@@ -320,8 +313,9 @@ impl MqttMessenger {
                         Err(e) => {
                             println!("\rFailed to decrypt message: {}", e);
                             
-                            // If decryption failed, try to re-establish the session
-                            if !enc_message.is_initial_kyber && !used_ephemeral {
+                            // If decryption failed and this is not an initial Kyber message, we might
+                            // have a session mismatch - print more debugging info
+                            if !enc_message.is_initial_kyber {
                                 println!("\rAttempting to re-establish session with {}", enc_message.sender_id);
                             }
                             
@@ -406,18 +400,24 @@ impl MqttMessenger {
             .ok_or_else(|| format!("Device {} not found", recipient_id))?
             .clone();
         
-        // Drop the lock before proceeding with potentially time-consuming operations
+        // Drop the lock before proceeding
         drop(devices);
-            
-        // Generate an ephemeral keypair for our side of the key exchange
-        let (_, public) = self.crypto.generate_ephemeral_keypair();
-        let ephemeral_key_b64 = BASE64.encode(public.as_bytes());
         
-        // Create a key exchange message to establish forward secrecy
+        // Generate our ephemeral keypair
+        let (ephemeral_secret, ephemeral_public) = self.crypto.generate_ephemeral_keypair();
+        println!("Generated ephemeral key for session with {}: {}", 
+                 recipient_id, hex::encode(ephemeral_public.as_bytes()));
+        
+        // Store our ephemeral secret for this recipient
+        self.crypto.store_ephemeral_secret(recipient_id, ephemeral_secret);
+        
+        // Send our ephemeral public key to the recipient
+        let ephemeral_key_b64 = BASE64.encode(ephemeral_public.as_bytes());
+        
         let message = EncryptedMessage {
             sender_id: self.device_id.clone(),
             recipient_id: Some(recipient_id.to_string()),
-            encrypted_data: "".to_string(), // No data needed for key exchange
+            encrypted_data: "".to_string(),
             nonce: "".to_string(),
             message_type: MessageType::KeyExchange,
             timestamp: Utc::now().timestamp() as u64,
@@ -425,7 +425,7 @@ impl MqttMessenger {
             is_initial_kyber: false,
         };
         
-        let message_json = serde_json::to_string(&message).map_err(|e| format!("JSON error: {}", e))?;
+        let message_json = serde_json::to_string(&message)?;
         
         // Send the key exchange message
         let recipient_topic = format!("secure-msg/device/{}", recipient_id);
@@ -435,22 +435,18 @@ impl MqttMessenger {
             QoS::AtLeastOnce,
             false,
             message_json.as_bytes(),
-        ).map_err(|e| format!("Publish error: {:?}", e))?;
+        )?;
         
-        // Also create a session on our side if the recipient has already shared their ephemeral key
-        if let Some(recipient_ephemeral_key) = &recipient.ephemeral_key {
-            if let Ok(key_bytes) = BASE64.decode(recipient_ephemeral_key) {
-                // Process the ephemeral key to create our session
-                match self.crypto.create_forward_secrecy_session(recipient_id, &key_bytes) {
-                    Ok(_) => {
-                        println!("\rCreated session with ephemeral key from {}", recipient_id);
-                        // Give time for the key exchange to complete
-                        thread::sleep(Duration::from_millis(10));
-                    },
-                    Err(e) => {
-                        println!("\rWarning: Failed to create session: {}", e);
-                    }
-                }
+        // Wait for the message to be delivered
+        drop(client);
+        thread::sleep(Duration::from_millis(300));
+        
+        // If we already have the recipient's ephemeral key, create the session
+        if let Some(their_ephemeral_key) = recipient.ephemeral_key {
+            if let Ok(key_bytes) = BASE64.decode(&their_ephemeral_key) {
+                self.crypto.create_session_from_stored_secret(recipient_id, &key_bytes)?;
+                println!("Created session with existing ephemeral key from {}", recipient_id);
+                thread::sleep(Duration::from_millis(100));
             }
         }
         
@@ -469,38 +465,19 @@ impl MqttMessenger {
         let text_msg_json = serde_json::to_string(&text_msg).map_err(|e| format!("JSON error: {}", e))?;
         
         let (encrypted_data, nonce, ephemeral_public, topic, is_initial_kyber) = if let Some(recipient) = &recipient_id {
+            // FIX: Don't re-establish session here - we'll assume initialize_session was called first
             // Personal message - try to use forward secrecy if available
-            let recipient_info = {
-                let devices = self.known_devices.lock().unwrap();
-                let device = devices.iter().find(|d| d.device_id == *recipient);
-                
-                match device {
-                    Some(d) => d.clone(),
-                    None => return Err(format!("Device {} not found", recipient))
-                }
-            };
-            
-            // Check if we already have a session established
             let has_session = {
                 let sessions = self.crypto.session_keys.lock().unwrap();
                 sessions.contains_key(recipient)
             };
             
-            // If no session exists, try to establish one first
             if !has_session {
-                // Try to establish a session if recipient has shared their ephemeral key
-                if let Some(ephemeral_key) = &recipient_info.ephemeral_key {
-                    if let Ok(ephemeral_bytes) = BASE64.decode(ephemeral_key) {
-                        match self.crypto.create_forward_secrecy_session(recipient, &ephemeral_bytes) {
-                            Ok(_) => {
-                                println!("Created forward secrecy session with {}", recipient);
-                            }
-                            Err(e) => {
-                                println!("Warning: Failed to create session: {}", e);
-                            }
-                        }
-                    }
-                }
+                // Session not established - initialize it first
+                self.initialize_session(recipient)?;
+                
+                // IMPORTANT FIX: Allow time for the session to be established
+                thread::sleep(Duration::from_millis(300));
             }
             
             // Try to use session keys first for forward secrecy (AES-256)
@@ -525,7 +502,17 @@ impl MqttMessenger {
                     print!("\r> ");
                     io::stdout().flush().ok();
                     
-                    // No session yet, fall back to Kyber encryption
+                    // Fall back to Kyber encryption
+                    let recipient_info = {
+                        let devices = self.known_devices.lock().unwrap();
+                        let device = devices.iter().find(|d| d.device_id == *recipient);
+                        
+                        match device {
+                            Some(d) => d.clone(),
+                            None => return Err(format!("Device {} not found", recipient))
+                        }
+                    };
+                    
                     let (ciphertext, nonce_bytes) = self.crypto.encrypt_message(
                         &recipient_info.public_key, 
                         text_msg_json.as_bytes()
