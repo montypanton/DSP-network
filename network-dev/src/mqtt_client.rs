@@ -49,7 +49,7 @@ impl MqttMessenger {
         let thread_client = Arc::clone(&client);
         
         // Create the messenger instance
-        let messenger = Self {
+        let mut messenger = Self {
             device_id: device_id.clone(),
             client,
             crypto,
@@ -92,26 +92,33 @@ impl MqttMessenger {
             }
             
             loop {
+                // Handle the double Result wrapper from connection.recv()
                 match connection.recv() {
-                    Ok(event) => {
-                        // IMPORTANT FIX: Using Ok() pattern to match the Event
-                        if let Event::Incoming(Packet::Publish(publish)) = event {
-                            // Process received message
-                            if let Ok(enc_message) = serde_json::from_slice::<EncryptedMessage>(&publish.payload) {
-                                // Debug log
-                                println!("Message received from {} (type: {:?})", 
-                                        enc_message.sender_id, 
-                                        enc_message.message_type);
+                    Ok(Ok(Event::Incoming(Packet::Publish(publish)))) => {
+                        // Process received message
+                        if let Ok(enc_message) = serde_json::from_slice::<EncryptedMessage>(&publish.payload) {
+                            // Debug log
+                            println!("Message received from {} (type: {:?})", 
+                                    enc_message.sender_id, 
+                                    enc_message.message_type);
+                            
+                            // If this is a discovery request, respond with our device info
+                            let topic = publish.topic.clone();
+                            if topic == "secure-msg/discovery" 
+                               && enc_message.message_type == MessageType::DeviceAnnounce 
+                               && enc_message.sender_id != thread_device_id {
                                 
-                                // If this is a discovery request, respond with our device info
-                                let topic = publish.topic.clone();
-                                if topic == "secure-msg/discovery" 
-                                   && enc_message.message_type == MessageType::DeviceAnnounce 
-                                   && enc_message.sender_id != thread_device_id {
+                                // If this is a discovery request or another device's announcement,
+                                // respond with our own device info only if it's a discovery request
+                                if let Ok(mut client) = thread_client.lock() {
+                                    // Only respond to actual discovery requests, not just announcements
+                                    let is_discovery_request = if let Ok(decoded) = BASE64.decode(&enc_message.encrypted_data) {
+                                        String::from_utf8_lossy(&decoded) == "discovery_request"
+                                    } else {
+                                        false
+                                    };
                                     
-                                    // If this is a discovery request or another device's announcement,
-                                    // respond with our own device info
-                                    if let Ok(mut client) = thread_client.lock() {
+                                    if is_discovery_request {
                                         let device_info = thread_crypto.get_device_info(&thread_device_id);
                                         if let Ok(device_json) = serde_json::to_string(&device_info) {
                                             let response = EncryptedMessage {
@@ -136,19 +143,27 @@ impl MqttMessenger {
                                         }
                                     }
                                 }
-                                
-                                Self::process_message(
-                                    &*thread_crypto,
-                                    &enc_message,
-                                    &thread_devices,
-                                    &thread_callback,
-                                    &thread_device_id,
-                                );
                             }
+                            
+                            Self::process_message(
+                                &*thread_crypto,
+                                &enc_message,
+                                &thread_devices,
+                                &thread_callback,
+                                &thread_device_id,
+                            );
                         }
                     },
-                    Err(e) => {
-                        eprintln!("Connection error: {:?}", e);
+                    Ok(Ok(_)) => {
+                        // Handle other event types if needed
+                    },
+                    Ok(Err(conn_err)) => {
+                        eprintln!("Connection error: {:?}", conn_err);
+                        // Try to reconnect after a delay
+                        thread::sleep(Duration::from_secs(5));
+                    },
+                    Err(recv_err) => {
+                        eprintln!("Receive error: {:?}", recv_err);
                         // Try to reconnect after a delay
                         thread::sleep(Duration::from_secs(5));
                     }
