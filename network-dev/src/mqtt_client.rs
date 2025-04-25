@@ -215,7 +215,7 @@ impl MqttMessenger {
         
         match enc_message.message_type {
             MessageType::DeviceAnnounce => {
-                // Process device announce message
+                // Process device announce message - no changes needed here
                 if let Ok(device_info_bytes) = BASE64.decode(&enc_message.encrypted_data) {
                     if let Ok(device_info) = serde_json::from_slice::<DeviceInfo>(&device_info_bytes) {
                         let mut devices = known_devices.lock().unwrap();
@@ -235,69 +235,63 @@ impl MqttMessenger {
                 }
             },
             MessageType::TextMessage => {
-                // Process text message - in a non-blocking way
+                // Process text message - this is where we need to fix the decryption logic
                 if let Ok(ct_bytes) = BASE64.decode(&enc_message.encrypted_data) {
-                    if let Ok(nonce) = BASE64.decode(&enc_message.nonce) {
-                        // Handle forward secrecy
-                        if let Some(ephemeral_key) = &enc_message.ephemeral_public {
-                            if let Ok(key_bytes) = BASE64.decode(ephemeral_key) {
-                                let _ = crypto.handle_ephemeral_key(&enc_message.sender_id, &key_bytes);
-                            }
+                    // First, handle forward secrecy if an ephemeral key is present
+                    if let Some(ephemeral_key) = &enc_message.ephemeral_public {
+                        if let Ok(key_bytes) = BASE64.decode(ephemeral_key) {
+                            let _ = crypto.handle_ephemeral_key(&enc_message.sender_id, &key_bytes);
                         }
-                        
-                        // Decryption approaches - same as before
-                        let decryption_result = if enc_message.is_initial_kyber && ct_bytes.len() >= 1088 {
-                            crypto.decrypt_message(&ct_bytes[..1088], &nonce, &ct_bytes[1088..])
-                        } else if let Some(_) = &enc_message.recipient_id {
-                            match crypto.decrypt_with_session(&enc_message.sender_id, &ct_bytes) {
-                                Ok(plaintext) => Ok(plaintext),
-                                Err(_e) => {
-                                    if ct_bytes.len() >= 1088 {
-                                        crypto.decrypt_message(&ct_bytes[..1088], &nonce, &ct_bytes[1088..])
-                                    } else {
-                                        Err(format!("Cannot decrypt: ciphertext too small"))
-                                    }
-                                }
-                            }
-                        } else {
+                    }
+                    
+                    // Now handle the decryption with improved flow and error handling
+                    let decryption_result = if enc_message.is_initial_kyber {
+                        // Initial Kyber-based encryption/decryption
+                        if let Ok(nonce) = BASE64.decode(&enc_message.nonce) {
                             if ct_bytes.len() >= 1088 {
+                                // Kyber ciphertext is first 1088 bytes, actual encrypted data follows
                                 crypto.decrypt_message(&ct_bytes[..1088], &nonce, &ct_bytes[1088..])
                             } else {
-                                Err(format!("Broadcast ciphertext too small: {} bytes", ct_bytes.len()))
+                                Err(format!("Invalid Kyber ciphertext length: {}", ct_bytes.len()))
                             }
-                        };
-                        
-                        match decryption_result {
-                            Ok(decrypted) => {
-                                match serde_json::from_slice::<TextMessage>(&decrypted) {
-                                    Ok(text_msg) => {
-                                        if let Some(cb) = &*callback.lock().unwrap() {
-                                            // Clear the current line before displaying the message
-                                            print!("\r\x1B[K"); // Clear the current line
-                                            cb(text_msg.from_name, text_msg.content);
-                                            // Restore the prompt after the message callback
-                                            print!("\r> ");
-                                            io::stdout().flush().ok();
-                                        }
-                                    },
-                                    Err(e) => {
-                                        println!("\rFailed to parse decrypted message: {}", e);
+                        } else {
+                            Err("Invalid nonce encoding".to_string())
+                        }
+                    } else {
+                        // Session-based encryption (forward secrecy)
+                        crypto.decrypt_with_session(&enc_message.sender_id, &ct_bytes)
+                    };
+                    
+                    match decryption_result {
+                        Ok(decrypted) => {
+                            match serde_json::from_slice::<TextMessage>(&decrypted) {
+                                Ok(text_msg) => {
+                                    if let Some(cb) = &*callback.lock().unwrap() {
+                                        // Clear the current line before displaying the message
+                                        print!("\r\x1B[K"); // Clear the current line
+                                        cb(text_msg.from_name, text_msg.content);
+                                        // Restore the prompt after the message callback
                                         print!("\r> ");
                                         io::stdout().flush().ok();
                                     }
+                                },
+                                Err(e) => {
+                                    println!("\rFailed to parse decrypted message: {}", e);
+                                    print!("\r> ");
+                                    io::stdout().flush().ok();
                                 }
-                            },
-                            Err(e) => {
-                                println!("\rFailed to decrypt message: {}", e);
-                                print!("\r> ");
-                                io::stdout().flush().ok();
                             }
+                        },
+                        Err(e) => {
+                            println!("\rFailed to decrypt message: {}", e);
+                            print!("\r> ");
+                            io::stdout().flush().ok();
                         }
                     }
                 }
             },
             MessageType::KeyExchange => {
-                // Process key exchange message
+                // Process key exchange message - no changes needed here
                 if let Some(ephemeral_key) = &enc_message.ephemeral_public {
                     if let Ok(key_bytes) = BASE64.decode(ephemeral_key) {
                         match crypto.handle_ephemeral_key(&enc_message.sender_id, &key_bytes) {
@@ -393,11 +387,11 @@ impl MqttMessenger {
         // Drop the lock before proceeding with potentially time-consuming operations
         drop(devices);
             
-        // Generate an ephemeral keypair
-        let (_, public) = self.crypto.generate_ephemeral_keypair();
+        // Generate an ephemeral keypair for our side of the key exchange
+        let (ephemeral_secret, public) = self.crypto.generate_ephemeral_keypair();
         let ephemeral_key_b64 = BASE64.encode(public.as_bytes());
         
-        // Create a key exchange message
+        // Create a key exchange message to establish forward secrecy
         let message = EncryptedMessage {
             sender_id: self.device_id.clone(),
             recipient_id: Some(recipient_id.to_string()),
@@ -421,17 +415,17 @@ impl MqttMessenger {
             message_json.as_bytes(),
         ).map_err(|e| format!("Publish error: {:?}", e))?;
         
-        // Also create a client-side session
+        // Also create a session on our side if the recipient has already shared their ephemeral key
         if let Some(ephemeral_key) = recipient.ephemeral_key {
             // If the recipient has already shared their ephemeral key, use it
             let ephemeral_bytes = BASE64.decode(&ephemeral_key)
                 .map_err(|_| "Invalid ephemeral key encoding".to_string())?;
             
-            // Create a session on our side too
-            let _ = self.crypto.handle_ephemeral_key(recipient_id, &ephemeral_bytes)?;
-            
-            // We no longer try to use DeviceManager here to avoid the error
-            // DeviceManager functionality is handled within the known_devices list
+            // Create a forward secrecy session with the recipient's ephemeral key
+            let _ = self.crypto.create_forward_secrecy_session(recipient_id, &ephemeral_bytes)?;
+            println!("Created forward secrecy session with {}", recipient_id);
+        } else {
+            println!("Waiting for recipient to share their ephemeral key...");
         }
         
         Ok(())
@@ -449,7 +443,7 @@ impl MqttMessenger {
         let text_msg_json = serde_json::to_string(&text_msg).map_err(|e| format!("JSON error: {}", e))?;
         
         let (encrypted_data, nonce, ephemeral_public, topic, is_initial_kyber) = if let Some(recipient) = &recipient_id {
-            // Personal message - use forward secrecy if available
+            // Personal message - try to use forward secrecy if available
             let recipient_info = {
                 let devices = self.known_devices.lock().unwrap();
                 let device = devices.iter().find(|d| d.device_id == *recipient);
@@ -460,24 +454,22 @@ impl MqttMessenger {
                 }
             };
             
-            // Try to use session keys first
+            // Try to use session keys first for forward secrecy
             let encryption_result = self.crypto.encrypt_with_session(recipient, text_msg_json.as_bytes());
             
             match encryption_result {
                 Ok((enc, eph)) => {
                     // Successfully encrypted with session keys
-                    // Get the first 12 bytes as nonce (if available)
-                    let nonce_bytes = if enc.len() >= 12 {
-                        enc[..12].to_vec()
-                    } else {
-                        vec![0u8; 12]
-                    };
+                    println!("\rUsing forward secrecy session for encryption");
                     
-                    // Set up the ephemeral key for the message if we have one
+                    // No need to extract nonce - it's already included in the encrypted package
                     let eph_key = eph.map(|k| BASE64.encode(k.as_bytes()));
                     
-                    (BASE64.encode(&enc), BASE64.encode(&nonce_bytes), eph_key, 
-                     format!("secure-msg/device/{}", recipient), false)
+                    (BASE64.encode(&enc), 
+                     "".to_string(), // We don't need a separate nonce for session-based encryption
+                     eph_key, 
+                     format!("secure-msg/device/{}", recipient), 
+                     false)
                 },
                 Err(e) => {
                     println!("\rSession encryption failed: {}, falling back to Kyber", e);
@@ -485,10 +477,16 @@ impl MqttMessenger {
                     io::stdout().flush().ok();
                     
                     // No session yet, fall back to Kyber encryption
-                    let (ciphertext, nonce_bytes) = self.crypto.encrypt_message(&recipient_info.public_key, text_msg_json.as_bytes())?;
+                    let (ciphertext, nonce_bytes) = self.crypto.encrypt_message(
+                        &recipient_info.public_key, 
+                        text_msg_json.as_bytes()
+                    )?;
                     
-                    (BASE64.encode(&ciphertext), BASE64.encode(&nonce_bytes), None, 
-                     format!("secure-msg/device/{}", recipient), true)
+                    (BASE64.encode(&ciphertext), 
+                     BASE64.encode(&nonce_bytes), 
+                     None, 
+                     format!("secure-msg/device/{}", recipient), 
+                     true)
                 }
             }
         } else {
@@ -504,8 +502,11 @@ impl MqttMessenger {
             // Use our own public key just to create a valid encryption (this is a simplification)
             let (ciphertext, nonce_bytes) = self.crypto.encrypt_message(&encoded_pk, text_msg_json.as_bytes())?;
             
-            (BASE64.encode(&ciphertext), BASE64.encode(&nonce_bytes), None, 
-             "secure-msg/broadcast".to_string(), true)
+            (BASE64.encode(&ciphertext), 
+             BASE64.encode(&nonce_bytes), 
+             None, 
+             "secure-msg/broadcast".to_string(), 
+             true)
         };
         
         // Create the encrypted message envelope

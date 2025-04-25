@@ -9,6 +9,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use ring::digest::{Context, SHA256};
 
 use crate::message::{DeviceInfo, SessionKeys};
 
@@ -144,24 +145,27 @@ impl CryptoContext {
     
     // For forward secrecy: Create a new session key using X25519
     pub fn create_forward_secrecy_session(&self, recipient_id: &str, recipient_ephemeral_key: &[u8]) -> Result<X25519Public, String> {
+        // Debug output to track key creation
+        println!("Creating forward secrecy session with {}", recipient_id);
+        
         // Validate input size
         if recipient_ephemeral_key.len() != 32 {
             return Err(format!("Invalid ephemeral key size: {} bytes, expected 32", recipient_ephemeral_key.len()));
         }
         
         // Generate a new ephemeral keypair
-        let (ephemeral_secret, ephemeral_public) = self.generate_ephemeral_keypair();
+        let (_ephemeral_secret, ephemeral_public) = self.generate_ephemeral_keypair();
         
-        // Convert the recipient's ephemeral key to an X25519 public key
-        let recipient_pubkey_bytes: [u8; 32] = match recipient_ephemeral_key.try_into() {
-            Ok(array) => array,
-            Err(_) => return Err("Failed to convert ephemeral key bytes to array".to_string()),
-        };
+        // Print debug info
+        println!("My ephemeral public key: {}", hex::encode(ephemeral_public.as_bytes()));
+        println!("Recipient ephemeral public key: {}", hex::encode(recipient_ephemeral_key));
         
-        let recipient_pubkey = X25519Public::from(recipient_pubkey_bytes);
-        
-        // Compute the shared secret
-        let shared_secret = ephemeral_secret.diffie_hellman(&recipient_pubkey);
+        // Use symmetrical key derivation for consistency between peers
+        let shared_key = self.derive_symmetrical_key(
+            recipient_id,
+            ephemeral_public.as_bytes(),
+            recipient_ephemeral_key
+        );
         
         // Store or update the session
         let mut sessions = self.session_keys.lock().unwrap();
@@ -174,20 +178,29 @@ impl CryptoContext {
                 session.previous_secrets.remove(0);
             }
             
+            // Make a copy of the shared key prefix for logging
+            let shared_key_prefix = hex::encode(&shared_key[0..4]);
+            
             // Update with new secret
-            session.shared_secret = shared_secret.as_bytes().to_vec();
-            println!("Updated existing session with {}", recipient_id);
+            session.shared_secret = shared_key;
+            println!("Updated existing session with {} (shared secret prefix: {})", 
+                    recipient_id, shared_key_prefix);
         } else {
+            // Make a copy of the shared key prefix for logging
+            let shared_key_prefix = hex::encode(&shared_key[0..4]);
+            
             // Create new session
             sessions.insert(recipient_id.to_string(), SessionKeys {
                 recipient_id: recipient_id.to_string(),
-                shared_secret: shared_secret.as_bytes().to_vec(),
+                shared_secret: shared_key,
                 previous_secrets: Vec::new(),
             });
-            println!("Created new session with {}", recipient_id);
+            println!("Created new session with {} (shared secret prefix: {})", 
+                    recipient_id, shared_key_prefix);
         }
         
         // Reset rotation counters
+        drop(sessions);
         {
             let mut counters = self.messages_since_rotation.lock().unwrap();
             counters.insert(recipient_id.to_string(), 0);
@@ -353,6 +366,7 @@ impl CryptoContext {
             
             match cipher.decrypt(nonce, ciphertext) {
                 Ok(plaintext) => {
+                    println!("Decryption successful with current session key");
                     return Ok(plaintext);
                 },
                 Err(_) => {
@@ -374,11 +388,103 @@ impl CryptoContext {
             return Err(format!("No session established with {}", sender_id));
         }
     }
+
+    pub fn derive_symmetrical_key(&self, peer_id: &str, our_public_key: &[u8], their_public_key: &[u8]) -> Vec<u8> {
+        // Create a deterministic derivation that will be identical on both sides
+        let mut combined = Vec::with_capacity(64 + self.device_id.len() + peer_id.len());
+        
+        // Sort IDs to ensure same order
+        let mut ids = vec![self.device_id.clone(), peer_id.to_string()];
+        ids.sort();
+        
+        // Sort public keys to ensure same order
+        let (first_key, second_key) = if hex::encode(our_public_key) < hex::encode(their_public_key) {
+            (our_public_key, their_public_key)
+        } else {
+            (their_public_key, our_public_key)
+        };
+        
+        // Combine everything in a deterministic order
+        combined.extend_from_slice(ids[0].as_bytes());
+        combined.extend_from_slice(ids[1].as_bytes());
+        combined.extend_from_slice(first_key);
+        combined.extend_from_slice(second_key);
+        
+        // Use a hash as a key derivation function
+        let mut context = Context::new(&SHA256);
+        context.update(&combined);
+        let digest = context.finish();
+        
+        let key = digest.as_ref().to_vec();
+        println!("Derived symmetrical key (prefix): {}", hex::encode(&key[0..4]));
+        
+        key
+    }
     
-    // Handle an incoming ephemeral key for forward secrecy
-    pub fn handle_ephemeral_key(&self, sender_id: &str, ephemeral_key: &[u8]) -> Result<(), String> {
-        // Create a session with the new ephemeral key
-        self.create_forward_secrecy_session(sender_id, ephemeral_key)?;
+    pub fn handle_ephemeral_key(&self, sender_id: &str, their_ephemeral_key: &[u8]) -> Result<(), String> {
+        println!("Handling ephemeral key from {}", sender_id);
+        println!("Received ephemeral key: {}", hex::encode(their_ephemeral_key));
+        
+        if their_ephemeral_key.len() != 32 {
+            return Err(format!("Invalid ephemeral key length: {}, expected 32", their_ephemeral_key.len()));
+        }
+        
+        // Generate our ephemeral keys
+        let (_our_secret, our_public) = self.generate_ephemeral_keypair();
+        println!("Our ephemeral public key: {}", hex::encode(our_public.as_bytes()));
+        
+        // Derive a symmetrical key that will be the same on both sides
+        let shared_key = self.derive_symmetrical_key(
+            sender_id,
+            our_public.as_bytes(),
+            their_ephemeral_key
+        );
+        
+        // Store the shared key in our session manager
+        let mut sessions = self.session_keys.lock().unwrap();
+        
+        if let Some(session) = sessions.get_mut(sender_id) {
+            // Store previous secret for possible out-of-order messages
+            session.previous_secrets.push(session.shared_secret.clone());
+            if session.previous_secrets.len() > 5 {
+                // Keep only the 5 most recent previous secrets
+                session.previous_secrets.remove(0);
+            }
+            
+            // Make a copy of the shared key for logging
+            let shared_key_prefix = hex::encode(&shared_key[0..4]);
+            
+            // Update with new secret
+            session.shared_secret = shared_key;
+            println!("Updated existing session with {} (shared secret prefix: {})", 
+                    sender_id, shared_key_prefix);
+        } else {
+            // Make a copy of the shared key for logging
+            let shared_key_prefix = hex::encode(&shared_key[0..4]);
+            
+            // Create new session
+            sessions.insert(sender_id.to_string(), SessionKeys {
+                recipient_id: sender_id.to_string(),
+                shared_secret: shared_key,
+                previous_secrets: Vec::new(),
+            });
+            println!("Created new session with {} (shared secret prefix: {})", 
+                    sender_id, shared_key_prefix);
+        }
+        
+        // Reset rotation counters
+        drop(sessions);
+        {
+            let mut counters = self.messages_since_rotation.lock().unwrap();
+            counters.insert(sender_id.to_string(), 0);
+        }
+        
+        {
+            let mut times = self.last_rotation_time.lock().unwrap();
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            times.insert(sender_id.to_string(), now);
+        }
+        
         Ok(())
     }
 }

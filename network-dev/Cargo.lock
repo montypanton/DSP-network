@@ -995,6 +995,7 @@ dependencies = [
  "pqcrypto-kyber",
  "pqcrypto-traits",
  "rand",
+ "ring 0.16.20",
  "rumqttc",
  "serde",
  "serde_json",
