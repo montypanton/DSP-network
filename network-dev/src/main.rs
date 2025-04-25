@@ -132,10 +132,10 @@ fn start_messenger(broker: &str, port: u16, display_name: &str) -> Result<(), Bo
     // Initialize crypto context
     let mut crypto_context = Arc::new(crypto::CryptoContext::new());
     
-    // Configure key rotation - every 5 messages or 5 minutes
+    // Configure key rotation - every 50 messages or 300 seconds (5 minutes)
     {
         let crypto_context_mut = Arc::get_mut(&mut crypto_context).unwrap();
-        crypto_context_mut.configure_rotation(5, 300);
+        crypto_context_mut.configure_rotation(50, 300);
     }
     
     let device_id = crypto_context.device_id.clone();

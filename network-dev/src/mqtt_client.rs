@@ -268,6 +268,8 @@ impl MqttMessenger {
                                 Ok(_) => {
                                     println!("\rUpdated session with ephemeral key from {}", enc_message.sender_id);
                                     used_ephemeral = true; // Mark that we used a new ephemeral key
+                                    // Give time for the key exchange to complete
+                                    thread::sleep(Duration::from_millis(10));
                                 },
                                 Err(e) => {
                                     println!("\rWarning: Failed to handle ephemeral key: {}", e);
@@ -436,16 +438,20 @@ impl MqttMessenger {
         ).map_err(|e| format!("Publish error: {:?}", e))?;
         
         // Also create a session on our side if the recipient has already shared their ephemeral key
-        if let Some(ephemeral_key) = recipient.ephemeral_key {
-            // If the recipient has already shared their ephemeral key, use it
-            let ephemeral_bytes = BASE64.decode(&ephemeral_key)
-                .map_err(|_| "Invalid ephemeral key encoding".to_string())?;
-            
-            // Create a forward secrecy session with the recipient's ephemeral key
-            let _ = self.crypto.create_forward_secrecy_session(recipient_id, &ephemeral_bytes)?;
-            println!("Created forward secrecy session with {}", recipient_id);
-        } else {
-            println!("Waiting for recipient to share their ephemeral key...");
+        if let Some(ephemeral_key) = &enc_message.ephemeral_public {
+            if let Ok(key_bytes) = BASE64.decode(ephemeral_key) {
+                // Process the ephemeral key first to update our session
+                match crypto.handle_ephemeral_key(&enc_message.sender_id, &key_bytes) {
+                    Ok(_) => {
+                        println!("\rUpdated session with new ephemeral key from {}", enc_message.sender_id);
+                        // Important: Give time for the key exchange to complete before trying to decrypt
+                        thread::sleep(Duration::from_millis(10));
+                    },
+                    Err(e) => {
+                        println!("\rWarning: Failed to handle ephemeral key: {}", e);
+                    }
+                }
+            }
         }
         
         Ok(())

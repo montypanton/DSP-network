@@ -43,7 +43,7 @@ impl CryptoContext {
             kyber_public_key,
             session_keys: Arc::new(Mutex::new(HashMap::new())),
             messages_since_rotation: Arc::new(Mutex::new(HashMap::new())),
-            rotation_interval: 10, // Rotate keys every 10 messages by default
+            rotation_interval: 50, // Rotate keys every 50 messages by default
             last_rotation_time: Arc::new(Mutex::new(HashMap::new())),
             time_rotation_interval: 300, // Rotate keys every 5 minutes by default
         }
@@ -53,6 +53,8 @@ impl CryptoContext {
     pub fn configure_rotation(&mut self, message_interval: usize, time_interval_secs: u64) {
         self.rotation_interval = message_interval;
         self.time_rotation_interval = time_interval_secs;
+        println!("Configured key rotation: every {} messages or {} seconds", 
+                 message_interval, time_interval_secs);
     }
     
     // Create a device info object for sharing
@@ -255,6 +257,8 @@ impl CryptoContext {
             should_rotate_by_count = *count >= self.rotation_interval;
             
             if should_rotate_by_count {
+                println!("Key rotation triggered by message count: {}/{}", 
+                        *count, self.rotation_interval);
                 *count = 0; // Reset counter if we're going to rotate
             }
         }
@@ -266,6 +270,8 @@ impl CryptoContext {
             should_rotate_by_time = now - *last_time >= self.time_rotation_interval;
             
             if should_rotate_by_time {
+                println!("Key rotation triggered by time: {} seconds since last rotation", 
+                        now - *last_time);
                 *last_time = now; // Update last rotation time
             }
         }
@@ -299,7 +305,7 @@ impl CryptoContext {
         }
         
         // Generate a new ephemeral keypair 
-        let (ephemeral_secret, ephemeral_public) = self.generate_ephemeral_keypair();
+        let (_ephemeral_secret, ephemeral_public) = self.generate_ephemeral_keypair();
         
         // Update the session counter
         {
@@ -444,24 +450,30 @@ impl CryptoContext {
         }
     }
 
-    pub fn derive_symmetrical_key(&self, peer_id: &str, our_public_key: &[u8], their_public_key: &[u8]) -> Vec<u8> {
+    pub fn derive_symmetrical_key(&self, peer_id: &str, our_ephemeral_key: &[u8], their_ephemeral_key: &[u8]) -> Vec<u8> {
         // Create a deterministic derivation that will be identical on both sides
         let mut combined = Vec::with_capacity(64 + self.device_id.len() + peer_id.len());
         
-        // Sort IDs to ensure same order
-        let mut ids = vec![self.device_id.clone(), peer_id.to_string()];
-        ids.sort();
-        
-        // Sort public keys to ensure same order
-        let (first_key, second_key) = if hex::encode(our_public_key) < hex::encode(their_public_key) {
-            (our_public_key, their_public_key)
+        // Sort device IDs lexicographically for consistency
+        let (first_id, second_id) = if self.device_id < peer_id.to_string() {
+            (self.device_id.as_str(), peer_id)
         } else {
-            (their_public_key, our_public_key)
+            (peer_id, self.device_id.as_str())
+        };
+        
+        // Sort public keys for consistency
+        let our_key_hex = hex::encode(our_ephemeral_key);
+        let their_key_hex = hex::encode(their_ephemeral_key);
+        
+        let (first_key, second_key) = if our_key_hex < their_key_hex {
+            (our_ephemeral_key, their_ephemeral_key)
+        } else {
+            (their_ephemeral_key, our_ephemeral_key)
         };
         
         // Combine everything in a deterministic order
-        combined.extend_from_slice(ids[0].as_bytes());
-        combined.extend_from_slice(ids[1].as_bytes());
+        combined.extend_from_slice(first_id.as_bytes());
+        combined.extend_from_slice(second_id.as_bytes());
         combined.extend_from_slice(first_key);
         combined.extend_from_slice(second_key);
         
@@ -485,7 +497,7 @@ impl CryptoContext {
         }
         
         // Generate our ephemeral keys
-        let (_, our_public) = self.generate_ephemeral_keypair();
+        let (_ephemeral_secret, our_public) = self.generate_ephemeral_keypair();
         println!("Our ephemeral public key: {}", hex::encode(our_public.as_bytes()));
         
         // Derive a symmetrical key that will be the same on both sides
